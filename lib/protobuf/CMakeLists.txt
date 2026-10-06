@@ -1,7 +1,5 @@
 
-if(NOT PROTOC OR NOT EXISTS "${PROTOC}")
-	find_program(PROTOC protoc)
-endif()
+find_program(PROTOC protoc)
 if(NOT PROTOC)
 	message(FATAL_ERROR "Could not find protoc")
 endif()
@@ -13,9 +11,7 @@ add_custom_command(OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/takion.pb"
 set(SOURCE_FILES "${CMAKE_CURRENT_BINARY_DIR}/takion.pb.c")
 set(HEADER_FILES "${CMAKE_CURRENT_BINARY_DIR}/takion.pb.h")
 
-# emcmake sets UNIX=TRUE even on a Windows host. cmake -E env with a
-# colon-separated PATH then splits on spaces ("Program Files", etc.).
-if(CMAKE_HOST_UNIX AND IS_ABSOLUTE "${PROTOC}")
+if(UNIX AND IS_ABSOLUTE "${PROTOC}")
 	# make sure protoc is in PATH when invoking the generator below, which needs it.
 	get_filename_component(PROTOC_PATH "${PROTOC}" DIRECTORY)
 	set(GEN_PREFIX "${CMAKE_COMMAND}" -E env "PATH=${PROTOC_PATH}:$ENV{PATH}")

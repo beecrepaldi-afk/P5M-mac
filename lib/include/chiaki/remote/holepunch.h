@@ -36,10 +36,6 @@
 #include <ws2tcpip.h>
 #else
 #include <unistd.h>
-#include <netinet/in.h>
-#endif
-#ifndef INET6_ADDRSTRLEN
-#define INET6_ADDRSTRLEN 46
 #endif
 
 #ifdef __cplusplus
@@ -208,6 +204,9 @@ CHIAKI_EXPORT ChiakiHolepunchSession chiaki_holepunch_session_init(
  */
 CHIAKI_EXPORT void chiaki_holepunch_session_force_port_guessing(
     ChiakiHolepunchSession session, bool enabled);
+
+CHIAKI_EXPORT void chiaki_holepunch_session_set_ws_fqdn_override(
+    ChiakiHolepunchSession session, const char *fqdn);
 
     /**
  *
