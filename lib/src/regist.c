@@ -27,10 +27,12 @@ typedef uint32_t in_addr_t;
 
 #define SEARCH_REQUEST_SLEEP_MS 100
 #define REGIST_SEARCH_TIMEOUT_MS 3000
+#define REGIST_SEARCH_RESEND_MS 500
 #define REGIST_REPONSE_TIMEOUT_MS 3000
 
 static void *regist_thread_func(void *user);
 static ChiakiErrorCode regist_search(ChiakiRegist *regist, struct addrinfo *addrinfos, struct sockaddr *recv_addr, socklen_t *recv_addr_size);
+static int regist_search_send(ChiakiRegist *regist, chiaki_socket_t sock, const char *src, struct sockaddr *send_addr, socklen_t send_addr_len);
 static chiaki_socket_t regist_search_connect(ChiakiRegist *regist, struct addrinfo *addrinfos, struct sockaddr *send_addr, socklen_t *send_addr_len);
 static ChiakiErrorCode regist_request_connect(ChiakiRegist *regist, const struct sockaddr *addr, size_t addr_len, chiaki_socket_t *sock_out);
 static ChiakiErrorCode regist_recv_response(ChiakiRegist *regist, ChiakiRegisteredHost *host, chiaki_socket_t sock, ChiakiRPCrypt *rpcrypt, uint16_t remote_counter, char *send_buf, size_t send_buf_size);
@@ -448,6 +450,13 @@ fail:
 	return NULL;
 }
 
+static int regist_search_send(ChiakiRegist *regist, chiaki_socket_t sock, const char *src, struct sockaddr *send_addr, socklen_t send_addr_len)
+{
+	if(regist->info.broadcast)
+		return sendto_broadcast(regist->log, sock, src, strlen(src) + 1, 0, send_addr, send_addr_len);
+	return send(sock, src, strlen(src) + 1, 0);
+}
+
 static ChiakiErrorCode regist_search(ChiakiRegist *regist, struct addrinfo *addrinfos, struct sockaddr *recv_addr, socklen_t *recv_addr_size)
 {
 	CHIAKI_LOGI(regist->log, "Regist starting search");
@@ -467,11 +476,7 @@ static ChiakiErrorCode regist_search(ChiakiRegist *regist, struct addrinfo *addr
 	size_t res_size = strlen(res);
 
 	CHIAKI_LOGI(regist->log, "Regist sending search packet");
-	int r;
-	if(regist->info.broadcast)
-		r = sendto_broadcast(regist->log, sock, src, strlen(src) + 1, 0, (struct sockaddr *)&send_addr, send_addr_len);
-	else
-		r = send(sock, src, strlen(src) + 1, 0);
+	int r = regist_search_send(regist, sock, src, (struct sockaddr *)&send_addr, send_addr_len);
 	if(r < 0)
 	{
 		CHIAKI_LOGE(regist->log, "Regist failed to send search: %s", strerror(errno));
@@ -480,13 +485,31 @@ static ChiakiErrorCode regist_search(ChiakiRegist *regist, struct addrinfo *addr
 	}
 
 	uint64_t timeout_abs_ms = chiaki_time_now_monotonic_ms() + REGIST_SEARCH_TIMEOUT_MS;
+	uint64_t resend_abs_ms = chiaki_time_now_monotonic_ms() + REGIST_SEARCH_RESEND_MS;
 	while(true)
 	{
 		uint64_t now_ms = chiaki_time_now_monotonic_ms();
 		if(now_ms > timeout_abs_ms)
 			err = CHIAKI_ERR_TIMEOUT;
 		else
-			err = chiaki_stop_pipe_select_single(&regist->stop_pipe, sock, false, timeout_abs_ms - now_ms);
+		{
+			uint64_t wait_ms = timeout_abs_ms - now_ms;
+			if(resend_abs_ms > now_ms && resend_abs_ms - now_ms < wait_ms)
+				wait_ms = resend_abs_ms - now_ms;
+			err = chiaki_stop_pipe_select_single(&regist->stop_pipe, sock, false, wait_ms);
+			if(err == CHIAKI_ERR_TIMEOUT && chiaki_time_now_monotonic_ms() < timeout_abs_ms)
+			{
+				CHIAKI_LOGV(regist->log, "Regist re-sending search packet");
+				if(regist_search_send(regist, sock, src, (struct sockaddr *)&send_addr, send_addr_len) < 0)
+				{
+					CHIAKI_LOGE(regist->log, "Regist failed to send search: %s", strerror(errno));
+					err = CHIAKI_ERR_NETWORK;
+					goto done;
+				}
+				resend_abs_ms = chiaki_time_now_monotonic_ms() + REGIST_SEARCH_RESEND_MS;
+				continue;
+			}
+		}
 		if(err != CHIAKI_ERR_SUCCESS)
 		{
 			if(err == CHIAKI_ERR_TIMEOUT)
