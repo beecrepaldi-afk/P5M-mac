@@ -988,17 +988,7 @@ void StreamSession::ToggleMute()
 			return;
 		}
 #endif
-#if CHIAKI_GUI_ENABLE_SPEEX
-		if(speech_processing_enabled)
-		{
-			//Use 1 channel for SPEEX processing and then mix to 2 channels
-			InitMic(1, opus_encoder.audio_header.rate);
-		}
-		else
-			InitMic(2, opus_encoder.audio_header.rate);
-#else
-		InitMic(2, opus_encoder.audio_header.rate);
-#endif
+		OpenSessionMic();
 			if(!audio_in)
 			{
 				CHIAKI_LOGE(GetChiakiLog(), "Microphone initialization failed, leaving microphone muted");
@@ -1016,9 +1006,40 @@ void StreamSession::ToggleMute()
 		for(auto controller : controllers)
 			controller->SetDualsenseMic(muted);
 	});
-	if(audio_in)
-		SDL_PauseAudioDevice(audio_in, muted);
+	// P5M: muted closes the device, so macOS turns its microphone-in-use
+	// indicator off; unmuting opens it again.
+	if(muted)
+	{
+		if(audio_in)
+		{
+			SDL_CloseAudioDevice(audio_in);
+			audio_in = 0;
+		}
+	}
+	else if(!audio_in && mic_connected)
+	{
+		OpenSessionMic();
+		if(!audio_in)
+			CHIAKI_LOGE(GetChiakiLog(), "Microphone could not be reopened after unmuting");
+	}
+	else if(audio_in)
+		SDL_PauseAudioDevice(audio_in, 0);
 	emit MutedChanged();
+}
+
+void StreamSession::OpenSessionMic()
+{
+#if CHIAKI_GUI_ENABLE_SPEEX
+	if(speech_processing_enabled)
+	{
+		//Use 1 channel for SPEEX processing and then mix to 2 channels
+		InitMic(1, opus_encoder.audio_header.rate);
+	}
+	else
+		InitMic(2, opus_encoder.audio_header.rate);
+#else
+	InitMic(2, opus_encoder.audio_header.rate);
+#endif
 }
 
 void StreamSession::SetLoginPIN(const QString &pin)
@@ -1348,7 +1369,11 @@ void StreamSession::UpdateGamepads()
 					uint8_t scaled[3];
 					ScaledLedColor(scaled);
 					controller->ChangeLEDColor(scaled);
+					controller->SetDualSenseLedBrightness(led_brightness);
 				}
+				// SDL's own setup right after opening the controller turns the
+				// mute light off; apply it again with the rest (lit = muted).
+				controller->SetDualsenseMic(muted);
 			});
 			if (controller->IsDualSense() || controller->IsDualSenseEdge())
 			{
@@ -1719,7 +1744,9 @@ void StreamSession::InitMic(unsigned int channels, unsigned int rate)
 	spec.userdata = this;
 
 	SDL_AudioSpec obtained;
-	audio_in = SDL_OpenAudioDevice(audio_in_device_name.isEmpty() ? nullptr : qUtf8Printable(audio_in_device_name), true, &spec, &obtained, false);
+	// "Auto" is the label set after the first open, not a device name.
+	const bool mic_auto = audio_in_device_name.isEmpty() || audio_in_device_name == "Auto";
+	audio_in = SDL_OpenAudioDevice(mic_auto ? nullptr : qUtf8Printable(audio_in_device_name), true, &spec, &obtained, false);
 	if(!audio_in)
 	{
 		CHIAKI_LOGE(log.GetChiakiLog(), "Failed to open Microphone '%s': %s", qPrintable(audio_in_device_name), SDL_GetError());
@@ -2859,9 +2886,13 @@ void StreamSession::Event(ChiakiEvent *event)
 			led_brightness = event->led_brightness;
 			uint8_t led_state[3];
 			ScaledLedColor(led_state);
-			QMetaObject::invokeMethod(this, [this, led_state]() {
+			uint8_t level = led_brightness;
+			QMetaObject::invokeMethod(this, [this, led_state, level]() {
 				for(auto controller : controllers)
+				{
 					controller->ChangeLEDColor(led_state);
+					controller->SetDualSenseLedBrightness(level);
+				}
 			});
 			break;
 		}

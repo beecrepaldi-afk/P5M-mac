@@ -322,7 +322,7 @@ formato antigo de 0x11/0x12 bytes, a partir de `buf[0]`):
 | +5 | correção de inclinação | liga/desliga na fusão de movimento |
 | +6 | banda morta do giroscópio | idem |
 | +7..10 | preset de controle | não se aplica ao DualSense |
-| +11 | modo de vibração 1..5 | muda os bits do relatório HID |
+| +11 | modo de vibração 1..5 | muda os bits do relatório HID; visto: 1 no Homem-Aranha 2 e 2 fora dele (menu do PS5 ou jogo sem haptics avançados, sem faixa de haptics); significado exato a confirmar |
 | +12 | intensidade da vibração | `haptic_vol` |
 | +13 | intensidade dos gatilhos | `haptic_vol` |
 | +14 | brilho da barra (0/1/2 = 100/50/25%) | escala o RGB |
@@ -331,7 +331,7 @@ formato antigo de 0x11/0x12 bytes, a partir de `buf[0]`):
 Os usos de +0, +1..3, +4, +12 e +13 já eram conhecidos. Os de +5, +6, +11,
 +14 e +16 saem da ordem dos campos na estrutura do app, sem leitura direta
 do conversor; o P5M registra no diário (`[pad-info]`) quando mudam, para
-confirmar. O P5M aplica o brilho (+14) e deixa os outros só no diário.
+confirmar. O P5M aplica o brilho (+14), confirmado em sessão (0/1/2 seguem a opção do PS5), e deixa os outros só no diário.
 
 Outros pontos do app oficial que o P5M passou a seguir: mudo do microfone
 no bit 4 (0x10) do byte de economia de energia (o 0x08 é a economia do

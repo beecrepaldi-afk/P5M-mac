@@ -879,6 +879,21 @@ void Controller::SetDualsenseMic(bool on)
 #endif
 }
 
+// P5M: brilho dos LEDs de jogador pedido pelo console (0 = forte, 1 = médio,
+// 2 = fraco); a cor da barra é escalada à parte, na sessão.
+void Controller::SetDualSenseLedBrightness(uint8_t level)
+{
+#ifdef CHIAKI_GUI_ENABLE_SDL_GAMECONTROLLER
+	if((!is_dualsense && !is_dualsense_edge) || !controller)
+		return;
+	DS5EffectsState_t state;
+	SDL_zero(state);
+	state.ucEnableBits3 |= 0x01; /* LED brightness */
+	state.ucLedBrightness = level <= 2 ? level : 0;
+	SDL_GameControllerSendEffect(controller, &state, sizeof(state));
+#endif
+}
+
 // P5M: ao fim da sessão, como o app oficial: barra azul, LEDs de jogador e
 // de mudo apagados, em vez de deixar a cor do jogo acesa.
 void Controller::RestoreDualSenseLights()
@@ -892,6 +907,8 @@ void Controller::RestoreDualSenseLights()
 	state.ucMicLightMode = 0x00;
 	state.ucPadLights = 0x00;
 	state.ucLedBlue = 0xff;
+	state.ucEnableBits3 |= 0x01; /* LED brightness back to full */
+	state.ucLedBrightness = 0x00;
 	SDL_GameControllerSendEffect(controller, &state, sizeof(state));
 #endif
 }

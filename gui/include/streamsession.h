@@ -378,6 +378,7 @@ class StreamSession : public QObject
 
 	private slots:
 		void InitAudio(unsigned int channels, unsigned int rate);
+		void OpenSessionMic();
 		void InitMic(unsigned int channels, unsigned int rate);
 		void InitHaptics();
 		void Event(ChiakiEvent *event);
