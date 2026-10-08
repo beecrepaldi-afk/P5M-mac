@@ -59,9 +59,10 @@ constexpr int LOOPS_UNTIL_PARK = 24;        // ~250 ms of silence (in blocks): s
 constexpr size_t RING_BYTES = 1024;
 constexpr size_t RING_MAX_LAG = 384;
 
-// Full scale of the track: the console takes 16 bits straight to the coil;
-// 16384 gives twice its level (Quest dev.208, linear, no mu-law).
-constexpr float REFERENCE = 16384.0f;
+// Full scale of the track: the console takes 16 bits straight to the coil.
+// 32768 keeps the level of the USB path; 16384 (twice the level, from the
+// Quest) clipped the peaks and felt stronger and rougher over Bluetooth.
+constexpr float REFERENCE = 32768.0f;
 
 constexpr uint64_t POWER_EVERY_NS = 2'000'000'000;
 constexpr uint64_t DIARY_EVERY_NS = 10'000'000'000;
