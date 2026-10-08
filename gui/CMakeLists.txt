@@ -221,7 +221,7 @@ if(APPLE)
 endif()
 
 if(APPLE)
-    set(P5M_MAC_VERSION "0.1.0-beta.1" CACHE STRING "P5M macOS release version")
+    set(P5M_MAC_VERSION "0.1.0-beta.2" CACHE STRING "P5M macOS release version")
     set(P5M_BUNDLE_NAME "P5M")
     set(P5M_BUNDLE_ID "io.github.beecrepaldi-afk.p5m.mac")
     set(P5M_BUNDLE_VERSION "0.1.0")

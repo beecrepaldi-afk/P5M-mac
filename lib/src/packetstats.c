@@ -68,8 +68,10 @@ CHIAKI_EXPORT void chiaki_packet_stats_get(ChiakiPacketStats *stats, bool reset,
 	//		(unsigned long long)stats->gen_lost);
 
 	// seq
-	uint64_t seq_diff = stats->seq_max - stats->seq_min; // overflow on purpose if max < min
-	uint64_t seq_lost = stats->seq_received > seq_diff ? seq_diff : seq_diff - stats->seq_received;
+	// P5M: the sequence numbers are 16 bits; take the difference in 16 bits so a
+	// wrap (audio frame index, every ~11 min) does not count as 2^64 lost packets.
+	uint64_t seq_diff = (ChiakiSeqNum16)(stats->seq_max - stats->seq_min);
+	uint64_t seq_lost = stats->seq_received >= seq_diff ? 0 : seq_diff - stats->seq_received;
 	*received += stats->seq_received;
 	*lost += seq_lost;
 
