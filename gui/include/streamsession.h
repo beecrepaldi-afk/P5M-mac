@@ -202,6 +202,8 @@ class StreamSession : public QObject
 		int ps5_rumble_intensity;
 		int ps5_trigger_intensity;
 		uint8_t led_color[3];
+		uint8_t led_brightness; // P5M: do console, 0 = 100%, 1 = 50%, 2 = 25%
+		void ScaledLedColor(uint8_t out[3]) const;
 		uint8_t player_index;
 		QHash<int, Controller *> controllers;
 #if CHIAKI_GUI_ENABLE_SETSU

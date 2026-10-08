@@ -171,6 +171,7 @@ typedef enum {
 	CHIAKI_EVENT_HAPTIC_INTENSITY,
 	CHIAKI_EVENT_TRIGGER_INTENSITY,
 	CHIAKI_EVENT_VIDEO_FEC_FAILURE,
+	CHIAKI_EVENT_LED_BRIGHTNESS, // P5M: led_brightness (0 = 100%, 1 = 50%, 2 = 25%)
 } ChiakiEventType;
 
 typedef struct chiaki_event_t
@@ -185,6 +186,7 @@ typedef struct chiaki_event_t
 		ChiakiTriggerEffectsEvent trigger_effects;
 		uint8_t led_state[0x3];
 		uint8_t player_index;
+		uint8_t led_brightness;
 		struct
 		{
 			bool pin_incorrect; // false on first request, true if the pin entered before was incorrect

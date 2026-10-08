@@ -27,10 +27,16 @@ namespace {
 // report 0x39 (two blocks, 547 bytes, DS5Dongle/KytyPS5) was worse, ~50 ms
 // each, because most of it is speaker space we do not use. What helps is not
 // waiting: asynchronous reports, a few in flight, went ~3x faster.
-constexpr size_t REPORT_SIZE = 142;
+constexpr size_t REPORT_SIZE_32 = 142;
+// Report 0x39 (DS5Dongle): 547 bytes, two haptics blocks under a 0xD2 header,
+// room for two 200-byte Opus speaker packets that we leave empty. Opt-in with
+// P5M_BT_HAPTICS_REPORT=39: a dev saw fine detail (Astro Bot's glass) come
+// through 0x39 that 0x32 loses, but it is ~2x the bytes on the link.
+constexpr size_t REPORT_SIZE_39 = 547;
+constexpr size_t MAX_REPORT_SIZE = REPORT_SIZE_39;
+constexpr int MAX_BLOCKS_PER_REPORT = 2;
 constexpr size_t SAMPLES_OFFSET = 13;
 constexpr size_t SAMPLES_BYTES = 64;        // one block
-constexpr int BLOCKS_PER_REPORT = 1;
 constexpr int MAX_IN_FLIGHT = 4;            // ~43 ms of track on the way; more fails with NoMemory
 
 // Bytes 5-9: depth of the audio queue INSIDE the controller, in frames. The
@@ -42,7 +48,6 @@ constexpr uint8_t CONTROLLER_QUEUE = 16;
 // controller's own queue (which cannot be read) from creeping up between two
 // crystals; the shortfall lands in our queue, which the resampling absorbs.
 constexpr uint64_t BLOCK_NS = 10'672'000;
-constexpr uint64_t PERIOD_NS = BLOCK_NS * BLOCKS_PER_REPORT;
 
 // Our queue between the network and the 10.67 ms cadence (Quest dev.208).
 constexpr size_t QUEUE_BYTES = 1024;
@@ -121,6 +126,45 @@ int intProperty(IOHIDDeviceRef dev, CFStringRef key)
 	return v;
 }
 
+// Opens (shared, like SDL: triggers and light bar stay with SDL) the first
+// DualSense or Edge on Bluetooth; retained, or null.
+IOHIDDeviceRef findBluetoothDualSense(IOHIDManagerRef manager, ChiakiLog *log)
+{
+	NSArray *matching = @[
+		@{ @kIOHIDVendorIDKey: @0x054C, @kIOHIDProductIDKey: @0x0CE6 }, // DualSense
+		@{ @kIOHIDVendorIDKey: @0x054C, @kIOHIDProductIDKey: @0x0DF2 }, // DualSense Edge
+	];
+	IOHIDManagerSetDeviceMatchingMultiple(manager, (__bridge CFArrayRef)matching);
+	CFSetRef set = IOHIDManagerCopyDevices(manager);
+	if(!set)
+	{
+		// Some systems only list after the manager is opened (shared, no seize).
+		IOHIDManagerOpen(manager, kIOHIDOptionsTypeNone);
+		set = IOHIDManagerCopyDevices(manager);
+	}
+	if(!set)
+		return nullptr;
+	const CFIndex count = CFSetGetCount(set);
+	std::vector<IOHIDDeviceRef> devices(static_cast<size_t>(count));
+	CFSetGetValues(set, (const void **)devices.data());
+	IOHIDDeviceRef found = nullptr;
+	for(IOHIDDeviceRef dev : devices)
+	{
+		if(!isBluetooth(dev))
+			continue;
+		if(IOHIDDeviceOpen(dev, kIOHIDOptionsTypeNone) != kIOReturnSuccess)
+		{
+			CHIAKI_LOGW(log, "[haptics-bt] found a DualSense over Bluetooth but could not open it");
+			continue;
+		}
+		CFRetain(dev);
+		found = dev;
+		break;
+	}
+	CFRelease(set);
+	return found;
+}
+
 } // namespace
 
 struct MacDualSenseBluetooth::Impl
@@ -138,7 +182,11 @@ struct MacDualSenseBluetooth::Impl
 	std::thread thread;
 	std::atomic<bool> running { false };
 	uint8_t sequence = 0;     // high nibble of byte 1
-	uint8_t audio_counter = 0; // byte 10 of 0x32
+	uint8_t audio_counter = 0; // byte 10 of 0x32, byte 9 of 0x39 (+2)
+	bool report39 = false;
+	bool lowpass = true;
+	size_t report_size = REPORT_SIZE_32;
+	int blocks_per_report = 1;
 
 	~Impl()
 	{
@@ -156,10 +204,12 @@ struct MacDualSenseBluetooth::Impl
 
 	bool send(uint8_t *r, size_t size)
 	{
+		if(!device)
+			return false;
 		r[1] = uint8_t((sequence & 0x0F) << 4) | (r[1] & 0x0F);
 		sequence = (sequence + 1) & 0x0F;
-		if(r[0] == 0x32)
-			r[10] = audio_counter++;
+		if(r[0] == 0x32 || r[0] == 0x39)
+			stampCounter(r);
 		sign(r, size);
 		return IOHIDDeviceSetReport(device, kIOHIDReportTypeOutput, r[0], r, CFIndex(size)) == kIOReturnSuccess;
 	}
@@ -178,13 +228,39 @@ struct MacDualSenseBluetooth::Impl
 		r[4] = 0x02 | 0x20 | 0x40;         // audio mute, haptics filter, motor power
 		r[12] = 0x00;                      // no power save, no mute
 		r[39] = 0x00;                      // no motor power reduction
-		r[42] = 0x01;                      // low-pass on: smooth like the console (Quest dev.208)
+		// Low-pass on: smooth like the console (Quest dev.208). It also takes the
+		// highs out, where fine detail like Astro Bot's glass lives;
+		// P5M_BT_HAPTICS_LOWPASS=0 turns it off to compare.
+		r[42] = lowpass ? 0x01 : 0x00;
 		return send(r, sizeof(r));
+	}
+
+	void stampCounter(uint8_t *r)
+	{
+		if(r[0] == 0x39)
+		{
+			r[9] = audio_counter;
+			audio_counter = uint8_t(audio_counter + 2);
+		}
+		else
+			r[10] = audio_counter++;
 	}
 
 	void build(uint8_t *r, const uint8_t *samples)
 	{
-		memset(r, 0, REPORT_SIZE);
+		memset(r, 0, report_size);
+		if(report39)
+		{
+			r[0] = 0x39;
+			r[2] = 0x91;                   // packet 0x11 (audio control), sized
+			r[3] = 0x06;
+			r[4] = 0x7E;                   // bit 6 required; bit 0 = mic (off)
+			r[5] = r[6] = r[7] = r[8] = CONTROLLER_QUEUE;
+			r[10] = 0xD2;                  // packet 0x12 (haptics), sized, bit 6
+			r[11] = SAMPLES_BYTES;
+			memcpy(r + 12, samples, SAMPLES_BYTES * 2);
+			return;
+		}
 		r[0] = 0x32;
 		r[2] = 0x91;                       // packet 0x11 (audio control), sized
 		r[3] = 0x07;
@@ -192,11 +268,11 @@ struct MacDualSenseBluetooth::Impl
 		r[5] = r[6] = r[7] = r[8] = r[9] = CONTROLLER_QUEUE;
 		r[11] = 0x92;                      // packet 0x12 (haptics), sized
 		r[12] = SAMPLES_BYTES;
-		memcpy(r + SAMPLES_OFFSET, samples, SAMPLES_BYTES * BLOCKS_PER_REPORT);
+		memcpy(r + SAMPLES_OFFSET, samples, SAMPLES_BYTES);
 	}
 
 	// Callbacks carregam somente o slot; nunca apontam para a sessão/Impl.
-	using AsyncReports = MacHidAsyncReports<MAX_IN_FLIGHT, REPORT_SIZE>;
+	using AsyncReports = MacHidAsyncReports<MAX_IN_FLIGHT, MAX_REPORT_SIZE>;
 	std::unique_ptr<AsyncReports> reports = std::make_unique<AsyncReports>();
 
 	static void sentCallback(void *context, IOReturn result, void *, IOHIDReportType, uint32_t, uint8_t *, CFIndex)
@@ -208,16 +284,18 @@ struct MacDualSenseBluetooth::Impl
 	// False quando todos os slots ainda aguardam seus próprios callbacks.
 	bool sendAsync(const uint8_t *report)
 	{
+		if(!device)
+			return true; // waiting for reopen(); this block is lost
 		auto *slot = reports->acquire(nowNs());
 		if(!slot)
 			return false;
 		uint8_t *r = slot->report.data();
-		memcpy(r, report, REPORT_SIZE);
+		memcpy(r, report, report_size);
 		r[1] = uint8_t((sequence & 0x0F) << 4) | (r[1] & 0x0F);
 		sequence = (sequence + 1) & 0x0F;
-		r[10] = audio_counter++;
-		sign(r, REPORT_SIZE);
-		if(IOHIDDeviceSetReportWithCallback(device, kIOHIDReportTypeOutput, r[0], r, CFIndex(REPORT_SIZE),
+		stampCounter(r);
+		sign(r, report_size);
+		if(IOHIDDeviceSetReportWithCallback(device, kIOHIDReportTypeOutput, r[0], r, CFIndex(report_size),
 				1.0, sentCallback, slot) != kIOReturnSuccess)
 		{
 			reports->submissionFailed(*slot);
@@ -256,6 +334,28 @@ struct MacDualSenseBluetooth::Impl
 		return n;
 	}
 
+	// P5M: the controller dropped and came back (a new IOHIDDevice): every
+	// send fails on the old one. Reopen it, with nothing in flight.
+	bool reopen()
+	{
+		if(device)
+		{
+			IOHIDDeviceUnscheduleFromRunLoop(device, CFRunLoopGetCurrent(), kCFRunLoopDefaultMode);
+			IOHIDDeviceClose(device, kIOHIDOptionsTypeNone);
+			CFRelease(device);
+			device = nullptr;
+		}
+		device = findBluetoothDualSense(manager, log);
+		if(!device)
+			return false;
+		IOHIDDeviceScheduleWithRunLoop(device, CFRunLoopGetCurrent(), kCFRunLoopDefaultMode);
+		reports->failed_in_row = 0;
+		sequence = 0;
+		const bool power = fullPower();
+		CHIAKI_LOGI(log, "[haptics-bt] controller reconnected; reopened it (full motor power %s)", power ? "accepted" : "refused");
+		return true;
+	}
+
 	void loop();
 };
 
@@ -267,42 +367,21 @@ std::unique_ptr<MacDualSenseBluetooth> MacDualSenseBluetooth::Open(ChiakiLog *lo
 	impl->manager = IOHIDManagerCreate(kCFAllocatorDefault, kIOHIDOptionsTypeNone);
 	if(!impl->manager)
 		return nullptr;
-	NSArray *matching = @[
-		@{ @kIOHIDVendorIDKey: @0x054C, @kIOHIDProductIDKey: @0x0CE6 }, // DualSense
-		@{ @kIOHIDVendorIDKey: @0x054C, @kIOHIDProductIDKey: @0x0DF2 }, // DualSense Edge
-	];
-	IOHIDManagerSetDeviceMatchingMultiple(impl->manager, (__bridge CFArrayRef)matching);
-	CFSetRef set = IOHIDManagerCopyDevices(impl->manager);
-	if(!set)
-	{
-		// Some systems only list after the manager is opened (shared, no seize).
-		IOHIDManagerOpen(impl->manager, kIOHIDOptionsTypeNone);
-		set = IOHIDManagerCopyDevices(impl->manager);
-	}
-	if(!set)
+	IOHIDDeviceRef dev = findBluetoothDualSense(impl->manager, log);
+	if(!dev)
 		return nullptr;
-	const CFIndex count = CFSetGetCount(set);
-	std::vector<IOHIDDeviceRef> devices(count);
-	CFSetGetValues(set, (const void **)devices.data());
-	for(IOHIDDeviceRef dev : devices)
+	impl->device = dev;
+	if(const char *env = getenv("P5M_BT_HAPTICS_LOWPASS"); env && strcmp(env, "0") == 0)
+		impl->lowpass = false;
+	if(const char *env = getenv("P5M_BT_HAPTICS_REPORT"); env && strcmp(env, "39") == 0)
 	{
-		if(!isBluetooth(dev))
-			continue;
-		// Shared, like SDL opens it: triggers and light bar stay with SDL.
-		if(IOHIDDeviceOpen(dev, kIOHIDOptionsTypeNone) != kIOReturnSuccess)
-		{
-			CHIAKI_LOGW(log, "[haptics-bt] found a DualSense over Bluetooth but could not open it");
-			continue;
-		}
-		CFRetain(dev);
-		impl->device = dev;
-		CHIAKI_LOGI(log, "[haptics-bt] DualSense%s over Bluetooth: raw haptics through report 0x32",
-			intProperty(dev, CFSTR(kIOHIDProductIDKey)) == 0x0DF2 ? " Edge" : "");
-		break;
+		impl->report39 = true;
+		impl->report_size = REPORT_SIZE_39;
+		impl->blocks_per_report = 2;
 	}
-	CFRelease(set);
-	if(!impl->device)
-		return nullptr;
+	CHIAKI_LOGI(log, "[haptics-bt] DualSense%s over Bluetooth: raw haptics through report %s, controller low-pass %s",
+		intProperty(dev, CFSTR(kIOHIDProductIDKey)) == 0x0DF2 ? " Edge" : "",
+		impl->report39 ? "0x39 (two blocks per report)" : "0x32", impl->lowpass ? "on" : "off");
 
 	Impl *d = impl.get();
 	d->running = true;
@@ -361,8 +440,10 @@ void MacDualSenseBluetooth::Impl::loop()
 	uint8_t incoming[READ_BYTES];
 	uint8_t queue[QUEUE_BYTES];
 	size_t queued = 0;
-	uint8_t report[REPORT_SIZE];
-	uint8_t samples[SAMPLES_BYTES * BLOCKS_PER_REPORT];
+	uint8_t report[MAX_REPORT_SIZE];
+	uint8_t samples[SAMPLES_BYTES * MAX_BLOCKS_PER_REPORT];
+	const int BLOCKS_PER_REPORT = blocks_per_report;
+	const uint64_t PERIOD_NS = BLOCK_NS * uint64_t(blocks_per_report);
 	bool flowing = false, parked = false;
 	int empty_loops = 0, silent_loops = 0;
 	double phase = 0.0;
@@ -378,7 +459,7 @@ void MacDualSenseBluetooth::Impl::loop()
 	unsigned busy = 0;
 
 	uint64_t next = nowNs();
-	uint64_t last_power = next, last_diary = next;
+	uint64_t last_power = next, last_diary = next, last_reopen = 0;
 	while(running.load(std::memory_order_relaxed))
 	{
 		next += PERIOD_NS;
@@ -537,6 +618,13 @@ void MacDualSenseBluetooth::Impl::loop()
 after_send:
 
 		const uint64_t now = nowNs();
+		constexpr unsigned FAILED_BEFORE_REOPEN = 20;
+		if(reports->failed_in_row >= FAILED_BEFORE_REOPEN && reports->inFlight() == 0 && now - last_reopen >= POWER_EVERY_NS)
+		{
+			last_reopen = now;
+			if(!reopen())
+				CHIAKI_LOGW(log, "[haptics-bt] sends keep failing and no DualSense on Bluetooth to reopen yet");
+		}
 		// The power report is a blocking send (16 ms or far more): only while
 		// parked, never in the middle of a vibration.
 		if(parked && reports->inFlight() == 0 && now - last_power >= POWER_EVERY_NS)

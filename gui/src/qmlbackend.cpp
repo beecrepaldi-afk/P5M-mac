@@ -19,6 +19,7 @@
 #ifdef Q_OS_MACOS
 #include "macWakeSleep.h"
 #include "macStreamActivity.h"
+#include "macControllerGestures.h"
 #include "macSystemIntegration.h"
 #elif defined(Q_OS_WINDOWS)
 #include "windowsWakeSleep.h"
@@ -428,7 +429,7 @@ QmlBackend::QmlBackend(Settings *settings, QmlMainWindow *window)
         });
         connect(psnToken, &PSNToken::UnauthorizedError, this, &QmlBackend::psnCredsExpired);
         connect(psnToken, &PSNToken::PSNTokenSuccess, this, [this]() {
-            qCWarning(chiakiGui) << "PSN Remote Connection Tokens Refreshed. Internet is back up";
+            qCInfo(chiakiGui) << "PSN Remote Connection Tokens Refreshed. Internet is back up";
             resume_session = false;
             psn_reconnect_tries = 0;
             psn_reconnect_timer->stop();
@@ -709,7 +710,7 @@ void QmlBackend::profileChanged()
         });
         connect(psnToken, &PSNToken::UnauthorizedError, this, &QmlBackend::psnCredsExpired);
         connect(psnToken, &PSNToken::PSNTokenSuccess, this, []() {
-            qCWarning(chiakiGui) << "PSN Remote Connection Tokens Refreshed. Internet is back up";
+            qCInfo(chiakiGui) << "PSN Remote Connection Tokens Refreshed. Internet is back up";
         });
         connect(psnToken, &PSNToken::PSNTokenSuccess, this, [this]() {
             resume_session = false;
@@ -1511,7 +1512,7 @@ void QmlBackend::autoRegister()
         });
         connect(psnToken, &PSNToken::UnauthorizedError, this, &QmlBackend::psnCredsExpired);
         connect(psnToken, &PSNToken::PSNTokenSuccess, this, []() {
-            qCWarning(chiakiGui) << "PSN Remote Connection Tokens Refreshed.";
+            qCInfo(chiakiGui) << "PSN Remote Connection Tokens Refreshed.";
         });
         connect(psnToken, &PSNToken::PSNTokenSuccess, this, [this, info]() {
             createSession(info);
@@ -1691,7 +1692,7 @@ void QmlBackend::connectToHost(int index, QString nickname)
             });
             connect(psnToken, &PSNToken::UnauthorizedError, this, &QmlBackend::psnCredsExpired);
             connect(psnToken, &PSNToken::PSNTokenSuccess, this, []() {
-                qCWarning(chiakiGui) << "PSN Remote Connection Tokens Refreshed.";
+                qCInfo(chiakiGui) << "PSN Remote Connection Tokens Refreshed.";
             });
             connect(psnToken, &PSNToken::PSNTokenSuccess, this, [this, info]() {
                 createSession(info);
@@ -2628,7 +2629,7 @@ void QmlBackend::refreshAuth()
     });
     connect(psnToken, &PSNToken::UnauthorizedError, this, &QmlBackend::psnCredsExpired);
     connect(psnToken, &PSNToken::PSNTokenSuccess, this, []() {
-        qCWarning(chiakiGui) << "PSN Remote Connection Tokens Refreshed.";
+        qCInfo(chiakiGui) << "PSN Remote Connection Tokens Refreshed.";
     });
     connect(psnToken, &PSNToken::PSNTokenSuccess, this, &QmlBackend::updatePsnHosts);
     connect(psnToken, &PSNToken::Finished, psnToken, &QObject::deleteLater);
@@ -2958,6 +2959,15 @@ static QString P5MReportSanitize(const QString &text)
         line.replace(session_id, QStringLiteral("\\1<redacted>"));
     }
     return lines.join(QLatin1Char('\n'));
+}
+
+bool QmlBackend::openControllerHomeButtonSettings()
+{
+#ifdef Q_OS_MACOS
+    return ::openControllerHomeButtonSettings();
+#else
+    return false;
+#endif
 }
 
 QString QmlBackend::reportProblem()

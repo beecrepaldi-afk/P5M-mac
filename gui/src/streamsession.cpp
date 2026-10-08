@@ -44,6 +44,10 @@
 #define PS5_TOUCHPAD_MAX_X 1919.0f
 #define PS5_TOUCHPAD_MAX_Y 1079.0f
 #define SESSION_RETRY_SECONDS 20
+// P5M: wait between session requests while the console still says "already in use".
+// Upstream passed SESSION_RETRY_SECONDS / 3 as milliseconds, which hammered the
+// console about 60 times a second (measured 08/10/2026: ~290 requests in 5 s).
+#define SESSION_RETRY_INTERVAL_MS 500
 #define HAPTIC_RUMBLE_MIN_STRENGTH 100
 
 #define MICROPHONE_SAMPLES 480
@@ -418,6 +422,7 @@ StreamSession::StreamSession(const StreamSessionConnectInfo &connect_info, QObje
 	input_block = 0;
 	player_index = 0;
 	memset(led_color, 0, sizeof(led_color));
+	led_brightness = 0;
 	packet_loss_max = connect_info.packet_loss_max;
 	ChiakiErrorCode err;
 #if CHIAKI_LIB_ENABLE_PI_DECODER
@@ -891,6 +896,7 @@ StreamSession::~StreamSession()
 			const uint8_t clear_effect[10] = { 0 };
 			controller->SetTriggerEffects(0x05, clear_effect, 0x05, clear_effect);
 			controller->SetRumble(0,0);
+			controller->RestoreDualSenseLights();
 			controller->Unref();
 		}
 	});
@@ -1338,7 +1344,11 @@ void StreamSession::UpdateGamepads()
 			}
 			QTimer::singleShot(1000, this, [this, controller] {
 				controller->ChangePlayerIndex(player_index);
-				controller->ChangeLEDColor(led_color);
+				{
+					uint8_t scaled[3];
+					ScaledLedColor(scaled);
+					controller->ChangeLEDColor(scaled);
+				}
 			});
 			if (controller->IsDualSense() || controller->IsDualSenseEdge())
 			{
@@ -1528,8 +1538,13 @@ void StreamSession::InitAudio(unsigned int channels, unsigned int rate)
 	mac_audio_output = std::make_unique<MacAudioOutput>();
 	mac_audio_last_underruns = 0;
 	std::string native_error;
+	// P5M: com P5M_AUDIO_CHANNELS o PS5 manda 5.1/7.1 em Opus multistream com mapeamento
+	// identidade. A ordem WAVE (L R C LFE Ls Rs ...) é a hipótese em teste.
+	const MacAudioLayout layout = !qEnvironmentVariableIsEmpty("P5M_AUDIO_CHANNELS")
+		? (channels == 6 ? MacAudioLayout::Wave51 : channels == 8 ? MacAudioLayout::Wave71 : MacAudioLayout::Unknown)
+		: MacAudioLayout::Unknown;
 	if(mac_audio_output->open(rate, static_cast<uint8_t>(channels), audio_out_device_name.toUtf8().toStdString(),
-		mac_spatial_audio, mac_head_tracking, static_cast<uint32_t>(audio_target_ms.load()), native_error))
+		mac_spatial_audio, mac_head_tracking, static_cast<uint32_t>(audio_target_ms.load()), native_error, layout))
 	{
 		const QString mode = QString::fromStdString(mac_audio_output->description());
 		SetAudioOutputStatus(mode);
@@ -2044,7 +2059,7 @@ void StreamSession::ConnectHaptics()
 		return;
 	}
 #ifdef Q_OS_MACOS
-	CHIAKI_LOGW(this->log.GetChiakiLog(), "If haptics aren't working, please configure your DualSense audio device as quadrophonic in Applications/Utitilities/Audio Midi Setup on your Mac");
+	CHIAKI_LOGI(this->log.GetChiakiLog(), "If haptics aren't working, please configure your DualSense audio device as quadrophonic in Applications/Utitilities/Audio Midi Setup on your Mac");
 #endif
 	// Opening the DualSense audio device blocks for about a second (CoreAudio
 	// sets the device up synchronously), so do it off the GUI thread and hand
@@ -2081,7 +2096,7 @@ void StreamSession::ConnectHaptics()
 			break;
 		}
 		if (!found)
-			CHIAKI_LOGW(haptics_log, "DualSense features were enabled and a DualSense is connected, but could not find the DualSense audio device!");
+			CHIAKI_LOGI(haptics_log, "No DualSense USB audio device found (expected over Bluetooth, where haptics go through report 0x32)");
 
 		if(device > 0)
 		{
@@ -2565,6 +2580,15 @@ void StreamSession::SetMicAuthorization(Authorization authorization)
 }
 #endif
 
+// P5M: o app oficial escala a cor da barra pelo brilho pedido pelo console
+// (0 = 100%, 1 = 50%, 2 = 25%) antes de mandar ao controle.
+void StreamSession::ScaledLedColor(uint8_t out[3]) const
+{
+	unsigned shift = led_brightness <= 2 ? led_brightness : 0;
+	for(int i = 0; i < 3; i++)
+		out[i] = uint8_t(led_color[i] >> shift);
+}
+
 void StreamSession::PushHapticsFrame(uint8_t *buf, size_t buf_size)
 {
 	if(buf_size == 0)
@@ -2768,7 +2792,7 @@ void StreamSession::Event(ChiakiEvent *event)
 		case CHIAKI_EVENT_QUIT:
 			if(!connected && !holepunch_session && chiaki_quit_reason_is_error(event->quit.reason) && connect_timer.elapsed() < SESSION_RETRY_SECONDS * 1000)
 			{
-				QTimer::singleShot(SESSION_RETRY_SECONDS / 3, this, &StreamSession::Start);
+				QTimer::singleShot(SESSION_RETRY_INTERVAL_MS, this, &StreamSession::Start);
 				return;
 			}
 			connected = false;
@@ -2824,7 +2848,17 @@ void StreamSession::Event(ChiakiEvent *event)
 		case CHIAKI_EVENT_LED_COLOR: {
 			memcpy(led_color, event->led_state, 3);
 			uint8_t led_state[3];
-			memcpy(led_state, led_color, 3);
+			ScaledLedColor(led_state);
+			QMetaObject::invokeMethod(this, [this, led_state]() {
+				for(auto controller : controllers)
+					controller->ChangeLEDColor(led_state);
+			});
+			break;
+		}
+		case CHIAKI_EVENT_LED_BRIGHTNESS: {
+			led_brightness = event->led_brightness;
+			uint8_t led_state[3];
+			ScaledLedColor(led_state);
 			QMetaObject::invokeMethod(this, [this, led_state]() {
 				for(auto controller : controllers)
 					controller->ChangeLEDColor(led_state);

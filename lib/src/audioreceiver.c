@@ -29,6 +29,10 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_audio_receiver_init(ChiakiAudioReceiver *au
 	audio_receiver->frame_index_startup = true;
 	audio_receiver->jitter_buffer_count = 0;
 	memset(audio_receiver->jitter_buffer, 0, sizeof(audio_receiver->jitter_buffer));
+	memset(&audio_receiver->header, 0, sizeof(audio_receiver->header));
+	audio_receiver->header_valid = false;
+	audio_receiver->single_unit_prefix = 0;
+	audio_receiver->single_unit_prefix_logs = 0;
 
 	ChiakiErrorCode err = chiaki_mutex_init(&audio_receiver->mutex, false);
 	if(err != CHIAKI_ERR_SUCCESS)
@@ -62,6 +66,9 @@ CHIAKI_EXPORT void chiaki_audio_receiver_stream_info(ChiakiAudioReceiver *audio_
 	CHIAKI_LOGI(audio_receiver->log, "  frame size = %d", audio_header->frame_size);
 	CHIAKI_LOGI(audio_receiver->log, "  unknown = %d", audio_header->unknown);
 
+	audio_receiver->header = *audio_header;
+	audio_receiver->header_valid = true;
+
 	header_cb = audio_receiver->session->audio_sink.header_cb;
 	header_cb_user = audio_receiver->session->audio_sink.user;
 
@@ -83,11 +90,78 @@ CHIAKI_EXPORT void chiaki_audio_receiver_stream_info(ChiakiAudioReceiver *audio_
 	}
 }
 
+// P5M: o STREAMINFO sempre diz 2 canais; o número real vem no nibble alto do byte
+// de tipo do pacote. Quando muda, reabre decodificador e saída com o novo valor.
+static void chiaki_audio_receiver_check_channels(ChiakiAudioReceiver *audio_receiver, uint8_t channels)
+{
+	if(!channels)
+		return;
+	ChiakiAudioHeader header;
+	bool change = false;
+	if(chiaki_mutex_lock(&audio_receiver->mutex) != CHIAKI_ERR_SUCCESS)
+		return;
+	if(audio_receiver->header_valid && audio_receiver->header.channels != channels)
+	{
+		header = audio_receiver->header;
+		header.channels = channels;
+		change = true;
+	}
+	chiaki_mutex_unlock(&audio_receiver->mutex);
+	if(!change)
+		return;
+	CHIAKI_LOGI(audio_receiver->log, "[audio-channels] console is sending %u channels; reopening audio", (unsigned)channels);
+	chiaki_audio_receiver_stream_info(audio_receiver, &header);
+}
+
+// P5M: áudio multicanal da v20 (modo 1). Cada pacote leva uma unidade do quadro,
+// a fonte (unit_index 0) ou uma de FEC (Reed-Solomon, ainda ignorada). A fonte traz
+// 2 bytes antes do pacote Opus multistream.
+static void chiaki_audio_receiver_single_unit(ChiakiAudioReceiver *audio_receiver, ChiakiTakionAVPacket *packet)
+{
+	uint16_t source_units = (uint16_t)(packet->units_in_frame_total - packet->units_in_frame_fec);
+	if(packet->unit_index >= source_units)
+		return;
+	if(source_units != 1 || packet->data_size <= 2)
+	{
+		if(audio_receiver->single_unit_prefix_logs < 5)
+		{
+			audio_receiver->single_unit_prefix_logs++;
+			CHIAKI_LOGW(audio_receiver->log, "[audio-channels] unexpected single-unit audio: %u source units, %zu bytes",
+				(unsigned)source_units, packet->data_size);
+		}
+		return;
+	}
+
+	if(!packet->is_haptics)
+		chiaki_audio_receiver_check_channels(audio_receiver, packet->audio_kind >> 4);
+
+	uint16_t prefix = (uint16_t)((packet->data[0] << 8) | packet->data[1]);
+	if(prefix != audio_receiver->single_unit_prefix && audio_receiver->single_unit_prefix_logs < 5)
+	{
+		audio_receiver->single_unit_prefix_logs++;
+		CHIAKI_LOGI(audio_receiver->log, "[audio-channels] multichannel unit prefix %#06x, %zu bytes", (unsigned)prefix, packet->data_size);
+	}
+	audio_receiver->single_unit_prefix = prefix;
+
+	if(packet->frame_index > (1 << 15))
+		audio_receiver->frame_index_startup = false;
+	chiaki_audio_receiver_frame(audio_receiver, packet->frame_index, packet->is_haptics, packet->data + 2, packet->data_size - 2);
+
+	if(audio_receiver->packet_stats)
+		chiaki_packet_stats_push_seq(audio_receiver->packet_stats, packet->frame_index);
+}
+
 CHIAKI_EXPORT void chiaki_audio_receiver_av_packet(ChiakiAudioReceiver *audio_receiver, ChiakiTakionAVPacket *packet)
 {
 	if(packet->codec != 5)
 	{
 		CHIAKI_LOGE(audio_receiver->log, "Received Audio Packet with unknown Codec");
+		return;
+	}
+
+	if(packet->audio_single_unit)
+	{
+		chiaki_audio_receiver_single_unit(audio_receiver, packet);
 		return;
 	}
 

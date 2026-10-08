@@ -417,6 +417,7 @@ Controller::~Controller()
 		const uint8_t clear_effect[10] = { 0 };
 		this->SetTriggerEffects(0x05, clear_effect, 0x05, clear_effect);
 		this->SetRumble(0,0);
+		this->RestoreDualSenseLights();
 		SDL_GameControllerClose(controller);
 	}
 #endif
@@ -865,13 +866,32 @@ void Controller::SetDualsenseMic(bool on)
 	if(on)
 	{
 		state.ucMicLightMode = 0x01;
-		state.ucAudioMuteBits = 0x08;
+		// P5M: bit 4 é o mudo do microfone; o 0x08 de antes é a economia de
+		// energia do áudio do controle (desligava o áudio junto).
+		state.ucAudioMuteBits = 0x10;
 	}
 	else
 	{
 		state.ucMicLightMode = 0x00;
 		state.ucAudioMuteBits = 0x00;
 	}
+	SDL_GameControllerSendEffect(controller, &state, sizeof(state));
+#endif
+}
+
+// P5M: ao fim da sessão, como o app oficial: barra azul, LEDs de jogador e
+// de mudo apagados, em vez de deixar a cor do jogo acesa.
+void Controller::RestoreDualSenseLights()
+{
+#ifdef CHIAKI_GUI_ENABLE_SDL_GAMECONTROLLER
+	if((!is_dualsense && !is_dualsense_edge) || !controller)
+		return;
+	DS5EffectsState_t state;
+	SDL_zero(state);
+	state.ucEnableBits2 |= 0x01 /* mic light */ | 0x04 /* light bar */ | 0x10 /* player lights */;
+	state.ucMicLightMode = 0x00;
+	state.ucPadLights = 0x00;
+	state.ucLedBlue = 0xff;
 	SDL_GameControllerSendEffect(controller, &state, sizeof(state));
 #endif
 }

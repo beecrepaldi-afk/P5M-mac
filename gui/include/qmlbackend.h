@@ -114,6 +114,8 @@ public:
     Q_INVOKABLE void showSystemDiagnostics();
     // Packs the last session diary (sanitized) and Mac details into a ZIP on the Desktop and opens a new issue.
     Q_INVOKABLE QString reportProblem();
+    // Opens the macOS setting that lets the PS button reach the console instead of the Game Overlay.
+    Q_INVOKABLE bool openControllerHomeButtonSettings();
     int runSystemAction(const QString &action, const QString &console_id);
     void refreshSystemConsoles();
     void captureSystemSessionMetrics(StreamSession *source);

@@ -2305,6 +2305,8 @@ static ChiakiErrorCode av_packet_parse(bool v12, bool v20, ChiakiTakionAVPacket 
 		return CHIAKI_ERR_INVALID_DATA;
 
 	packet->is_video = base_type == TAKION_PACKET_TYPE_VIDEO;
+	packet->audio_kind = 0;
+	packet->audio_single_unit = false;
 
 	packet->uses_nalu_info_structs = ((buf[0] >> 4) & 1) != 0;
 
@@ -2378,6 +2380,7 @@ static ChiakiErrorCode av_packet_parse(bool v12, bool v20, ChiakiTakionAVPacket 
 	if(v12 && !packet->is_video)
 	{
 		// v20 uses the high nibble of this byte for something new
+		packet->audio_kind = *av;
 		packet->is_haptics = (v20 ? (*av & 0xf) : *av) == 0x02;
 		av += 1;
 		av_size -= 1;
@@ -2393,6 +2396,14 @@ static ChiakiErrorCode av_packet_parse(bool v12, bool v20, ChiakiTakionAVPacket 
 		if(!total || v20_audio_fec >= total || total - v20_audio_fec > 0xf || v20_audio_fec > 0xf || unit_size > 0xff)
 			return CHIAKI_ERR_INVALID_DATA;
 		packet->units_in_frame_fec = (uint16_t)((unit_size << 8) | (v20_audio_fec << 4) | (total - v20_audio_fec));
+	}
+	else if(v20_audio_mode == 1)
+	{
+		// Multicanal: cada pacote leva uma unidade inteira (fonte ou FEC) do quadro.
+		if(v20_audio_fec >= packet->units_in_frame_total || packet->unit_index >= packet->units_in_frame_total)
+			return CHIAKI_ERR_INVALID_DATA;
+		packet->audio_single_unit = true;
+		packet->units_in_frame_fec = v20_audio_fec;
 	}
 
 	return CHIAKI_ERR_SUCCESS;

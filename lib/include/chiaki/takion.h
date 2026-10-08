@@ -45,6 +45,11 @@ typedef struct chiaki_takion_av_packet_t
 	uint16_t word_at_0x18;
 	uint8_t adaptive_stream_index;
 	uint8_t byte_at_0x2c;
+	// P5M: byte de tipo do áudio (v12+); na v20 o nibble alto é o número de canais.
+	uint8_t audio_kind;
+	// P5M: áudio v20 modo 1, uma unidade por pacote (multicanal). units_in_frame_fec
+	// guarda então só a contagem de FEC; a unidade fonte vem em unit_index 0.
+	bool audio_single_unit;
 
 	uint64_t key_pos;
 

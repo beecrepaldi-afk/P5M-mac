@@ -172,3 +172,168 @@ dos 8 bytes extras, por isso os gatilhos ficavam estranhos. Corrigido em
 Depois de vídeo, áudio, vibração e gatilhos confirmados, a negociação passou
 a rodar sempre no PS5. `P5M_TAKION_V20=0` volta à v12. Se o console não
 responder em 1 s, o stream segue na v12, como antes.
+
+## Tabela de recursos por versão (app oficial 9.5.0, análise de 08/10)
+
+Análise estática do binário arm64 no Ghidra; nada da Sony foi copiado. A
+função que responde "a versão V tem o recurso N?" recebe `(N, V)` e é uma
+tabela fixa:
+
+| Versão | Recursos ligados |
+|---|---|
+| 9 | 0–4 |
+| 10 | 0–3, 5 (sem o 4) |
+| 11 | 0–4, 6 (sem o 5) |
+| 12 | 0–4, 6, 7 (sem o 5) |
+| 13, 14 | 0–7 |
+| 15, 16, 17 | 0–12 |
+| 18 | 0–15 |
+| 19 | 0–16 |
+| 20 | 0–18 |
+
+**Da v13 em diante cada versão só acrescenta recursos; a v20 tem tudo o que
+as anteriores têm.** Os únicos "buracos" estão na v10–v12 (recursos 4 e 5).
+
+O que cada recurso controla, pelo código em volta das consultas (confiança
+entre parênteses; os números 0, 7, 14 e 18 não aparecem consultados):
+
+- 1: autenticação/cifra por pacote; descarta pacote que falha (alta).
+- 2: caminho de mensagens de controle tipo 10 (baixa).
+- 3: cria um objeto de stream/codec de 0x248 bytes (baixa).
+- 4: mensagem direta de alternar mute do microfone (`sendMicMute`) (média).
+- 5: escolha de callback e buffers de chave; casa com a troca P-521 (baixa).
+- 6: quadro de vídeo/áudio em subquadros (baixa).
+- 8: `sendGenericControlDataPayload`, dentro do recurso 4 (baixa).
+- 9: detecção de quadro tipo 9 no codec 6 (baixa).
+- 10: resposta de 9 bytes (controle tipo 3) ao `streaminfo` (média).
+- 11: byte extra 0x02 depois do marcador 0x21 (média-baixa).
+- 12: mensagem de controle tipo 0x1d (baixa).
+- 13: mensagem nova tipo 0x0e, enviada e recebida (média).
+- 15: aceita mensagem recebida tipo 6; sem o recurso, ela é descartada (média).
+- 16: `AUDIOSTATE availableBits` acima de 0xff (média-alta).
+- 17: cabeçalho estendido de 8 bytes; só a v20 (alta, confirma a seção acima).
+
+Recursos da v20 que o P5M ainda não usa (candidatos): 4/8 (mute do microfone
+e dados de controle genéricos), 13 (mensagem 0x0e), 15 (mensagem tipo 6 do
+console), 16 (estado de áudio).
+
+## Áudio multicanal (5.1/7.1), teste de 08/10 à tarde
+
+Experimental, ligado só por `P5M_AUDIO_CHANNELS=n` (0 estéreo, 1 5.1, 2 7.1,
+3 7.1.4, 4 estéreo alternativo). Sem a variável nada muda.
+
+**Como o cliente pede.** Duas coisas, como o app oficial (9.5.0):
+
+1. No JSON de lançamento (BIG), na raiz: `"audioChannelNumRP": n` e
+   `"audioSettings": {"audioChannels": [{"name": "main", "fecMode": 1,
+   "settings": [5 perfis]}]}`. Cada perfil tem `channels`, `sampleRate` 48000,
+   `samplesPerFrame` 480, `bitrate` (kbps), `isRawPcm` e `profileEnumType`
+   0–4. Canais por perfil, pela tabela do app: 2, 6, 8, 12, 2. A tabela de
+   bitrate do app só existe em execução; o P5M usa 32 kbps por canal (o
+   estéreo de hoje é 64).
+2. Depois do STREAMINFOACK: TakionMessage tipo 33 (AUDIOSTATE) com
+   `audio_state_type` 6 (CHANNELNUM) e 1 byte = n. **Sozinho não faz nada**;
+   o que liga o multicanal é o JSON de lançamento.
+
+O app do Mac manda também, ao receber o STREAMINFO, um AUDIOSTATE tipo 1
+(FLAGS) de 9 bytes: byte 0 = 0, uint32 LE `availableBits` = 3 no byte 1 e
+zeros nos bytes 5–8. Sem o recurso 16 da tabela, `availableBits` acima de
+0xff é cortado para 0xff (há um log disso no app).
+
+**O que o PS5 responde.**
+
+- O STREAMINFO continua dizendo 2 canais; não serve para saber o formato.
+  Ele lista as faixas de áudio: tipo 0 (jogo, Opus 48 kHz) e tipos 2–5 (PCM
+  cru, 2 canais, 16 bits, 3000 Hz, 30 amostras = haptics, um por controle).
+- O byte de tipo do pacote de áudio (v12+) tem no nibble alto o número de
+  canais: `0x20` estéreo, `0x60` 5.1; `0x22` são os haptics.
+- No 5.1 o campo de unidades da v20 vem no **modo 1** (bits 12–15 = 1,
+  12 bits baixos = nº de unidades FEC): cada pacote leva uma unidade inteira.
+  Com 192 kbps são 3 pacotes por quadro de 10 ms: a fonte (242 bytes) e duas
+  de FEC (244 bytes).
+- A fonte começa com 2 bytes (`00 02` em todas as sessões) e depois vem um
+  pacote Opus multistream. O primeiro byte da primeira stream é `f4` (CELT
+  48 kHz, 10 ms, estéreo).
+- As unidades FEC são Reed-Solomon em GF(256), polinômio 0x11d: a primeira
+  é a fonte multiplicada por x⁻¹ byte a byte (`f4`→`7a`, `49`→`aa`,
+  `00 02`→`00 01`). O P5M ainda as ignora.
+- Arranjo das streams no 5.1: 4 streams, 2 em estéreo (pares primeiro),
+  mapeamento identidade. O app oficial também usa mapeamento identidade de
+  até 12 canais. O P5M deduz streams/pares no primeiro pacote, pelo formato
+  autodelimitado (RFC 6716, apêndice B).
+
+**Resultado.** O P5M pede, recebe, decodifica e toca 6 canais sem falhas
+(~2,9 milhões de amostras a cada 10 s, nenhuma falta de áudio). Saída pelo
+CoreAudio com layout WAVE 5.1 e o mixer espacial nos alto-falantes do Mac.
+
+**Mas o PS5 só preenche L/R.** Com Homem-Aranha 2, os canais 2–5 vieram em
+silêncio digital (−180 dB) em todas as sessões, e o cabeçalho ficou `00 02`
+(provavelmente "2 canais ativos"). Descartado: pedido só por AUDIOSTATE,
+jogo sem surround, jogo aberto antes da sessão (reiniciado dentro dela) e
+saída do console em 2 canais (trocada para 7.1), Dolby Atmos no console
+(testado em PCM linear) e o aparelho declarado (o JSON de lançamento do app
+oficial é o mesmo do chiaki, com `bravia_tv` / `android`).
+
+FLAGS também não muda nada (sessões das 13:45 às 13:50): com
+`availableBits` 0x3f, e com 0x3 e valores 1, 2 e 3 nos bytes 5–8
+(`P5M_AUDIO_MASK` / `P5M_AUDIO_FLAGS`), o PS5 aceita a mensagem e segue em
+`00 02` com os canais 2–5 mudos. Conclusão provisória: o transporte 5.1
+existe, mas o console mistura para estéreo antes de codificar; o que o faz
+mandar surround de verdade não está no que o app do Mac envia.
+
+**Ordem dos canais:** ainda não verificada. O P5M usa WAVE
+(L R C LFE Ls Rs), mas com pares primeiro o mais provável é L R Ls Rs C LFE.
+A medição `[audio-channels] 10s levels` (volume e % de graves por canal)
+mostra o LFE (graves perto de 100%) quando os canais tiverem som.
+
+**Leitura do app oficial (08/10, depois dos testes de FLAGS).**
+
+- O número de canais do decodificador vem só do nibble alto do byte de tipo
+  do pacote (`AvHeader_20`, lido junto com o codec logo após o cabeçalho).
+  Quando ele muda no meio da sessão, o app recria o decodificador ("Reinit
+  audio decoder: [%d -> %d] channels") e manda telemetria
+  `AudioNumChannelsChange` (`numChannelsOld` / `numChannelsNew`). O
+  decodificador é a libopus padrão (`opus_multistream_decoder_create` com
+  mapeamento identidade e uma tabela streams/pares por nº de canais).
+- O cabeçalho de 2 bytes (`00 02`) não chega à libopus, então é tirado na
+  montagem do quadro; não achei onde nem se o app olha o valor.
+- Tudo o que o app manda de AUDIOSTATE: FLAGS (`availableBits` 3, valores 0)
+  ao receber o STREAMINFO e CHANNELNUM por uma função que aceita a opção
+  1–5. Não há HRTF, TVCONFIG nem PORTSTATES enviados, e o app do Mac não tem
+  texto de interface para surround; a configuração de cliente dele diz
+  `"audioChannels":"2.1"`.
+
+Conclusão: o P5M já manda tudo o que o app oficial manda para pedir
+multicanal. O PS5 abre o transporte 5.1, mas a mistura que ele codifica
+continua estéreo. Nada indica que o app oficial do Mac receba surround de
+verdade. O código fica atrás de `P5M_AUDIO_CHANNELS`: se um dia o console
+mandar conteúdo nos canais 2–5, o caminho até o CoreAudio já está pronto.
+
+## Pad info e DualSense (leitura do app oficial, 08/10)
+
+Pacote de pad info (0x19 bytes; 0x1a na v20), a partir de `buf[8]` (no
+formato antigo de 0x11/0x12 bytes, a partir de `buf[0]`):
+
+| Byte | Campo | O que o app oficial faz |
+|---|---|---|
+| +0 | índice do jogador | usa só o nibble baixo |
+| +1..3 | RGB da barra | escala pelo brilho e envia |
+| +4 | reset de movimento | só age com valor 1 |
+| +5 | correção de inclinação | liga/desliga na fusão de movimento |
+| +6 | banda morta do giroscópio | idem |
+| +7..10 | preset de controle | não se aplica ao DualSense |
+| +11 | modo de vibração 1..5 | muda os bits do relatório HID |
+| +12 | intensidade da vibração | `haptic_vol` |
+| +13 | intensidade dos gatilhos | `haptic_vol` |
+| +14 | brilho da barra (0/1/2 = 100/50/25%) | escala o RGB |
+| +16 | haptics nativo | escolhe entre emulação de rumble e haptics |
+
+Os usos de +0, +1..3, +4, +12 e +13 já eram conhecidos. Os de +5, +6, +11,
++14 e +16 saem da ordem dos campos na estrutura do app, sem leitura direta
+do conversor; o P5M registra no diário (`[pad-info]`) quando mudam, para
+confirmar. O P5M aplica o brilho (+14) e deixa os outros só no diário.
+
+Outros pontos do app oficial que o P5M passou a seguir: mudo do microfone
+no bit 4 (0x10) do byte de economia de energia (o 0x08 é a economia do
+áudio do controle) e, ao fim da sessão, barra azul e LEDs de jogador e de
+mudo apagados.

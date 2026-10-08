@@ -236,6 +236,142 @@ def vendor(app, extras):
     return inventory
 
 
+BOTTLE_TAG_MACOS = {'arm64_tahoe': '26.0', 'arm64_sequoia': '15.0', 'arm64_sonoma': '14.0'}
+
+
+def _uuid(path):
+    return tuple(re.findall(r'uuid ([A-Fa-f0-9-]+)', run('otool', '-l', path)))
+
+
+def _cellar_by_name(cellar):
+    index = {}
+    # Pelo nome do arquivo e dos symlinks (libfoo.3.dylib -> libfoo.3.2.1.dylib).
+    for path in cellar.glob('*/*/**/*'):
+        if path.is_file():
+            real = path.resolve()
+            if real.is_relative_to(cellar):
+                index.setdefault(path.name, []).append(real)
+    return index
+
+
+def _bottle_keg(formula, tag, scratch):
+    # Garrafas da mesma fórmula feitas para um macOS anterior, baixadas do
+    # registro oficial do Homebrew com o SHA-256 que a API publica. O Homebrew
+    # local só conhece as garrafas do próprio macOS e não é tocado.
+    target = scratch / tag / formula
+    if not target.is_dir():
+        api = json.loads(run('curl', '-fsSL', '--retry', '5', '--retry-all-errors', f'https://formulae.brew.sh/api/formula/{formula}.json'))
+        bottle = api['bottle']['stable']['files'].get(tag)
+        if not bottle:
+            raise RuntimeError(f'No {tag} bottle for {formula}')
+        tarball = scratch / f'{formula}-{tag}.tar.gz'
+        run('curl', '-fsSL', '--retry', '5', '--retry-all-errors', '-H', 'Authorization: Bearer QQ==', '-o', tarball, bottle['url'])
+        if hashlib.sha256(tarball.read_bytes()).hexdigest() != bottle['sha256']:
+            raise RuntimeError(f'SHA-256 mismatch for the {tag} bottle of {formula}')
+        target.mkdir(parents=True)
+        run('tar', '-xzf', tarball, '-C', target)
+        tarball.unlink()
+    kegs = [k for k in (target / formula).iterdir() if k.is_dir()]
+    if len(kegs) != 1:
+        raise RuntimeError(f'Unexpected bottle layout for {formula}: {kegs}')
+    return kegs[0]
+
+
+def _installed_name(dep, cellar):
+    # Garrafas citam o symlink (libavutil.61.dylib); o pacote guarda o arquivo
+    # real que o Homebrew instalado resolve (libavutil.61.1.100.dylib).
+    m = re.match(r'@@HOMEBREW_(?:CELLAR@@/([^/]+)/[^/]+|PREFIX@@/opt/([^/]+))/(.+)', dep)
+    if not m:
+        return None
+    local = cellar.parent / 'opt' / (m.group(1) or m.group(2)) / m.group(3)
+    return local.resolve().name if local.exists() else None
+
+
+def _relink_bottle(app, path, tag, scratch, cellar, by_name, inventory):
+    # Dependências da garrafa: o que o pacote já tem, ou (quando a garrafa
+    # antiga foi compilada com outra opção, ex. freetype com brotli) a garrafa
+    # dessa dependência, copiada para Frameworks e religada do mesmo jeito.
+    frameworks = app / 'Contents/Frameworks'
+    for dep in deps(path):
+        if dep.startswith(SYSTEM):
+            continue
+        name = Path(dep).name
+        mapped = by_name.get(name) or by_name.get(_installed_name(dep, cellar))
+        if mapped is None:
+            bundled = frameworks / name
+            if not bundled.exists():
+                m = re.match(r'@@HOMEBREW_(?:CELLAR@@/([^/]+)/[^/]+|PREFIX@@/opt/([^/]+))/(.+)', dep)
+                if not m:
+                    raise RuntimeError(f'{path.relative_to(app)} ({tag}) needs {dep}')
+                formula = m.group(1) or m.group(2)
+                keg = _bottle_keg(formula, tag, scratch)
+                source = (keg / m.group(3)).resolve()
+                shutil.copyfile(source, bundled)
+                os.chmod(bundled, 0o755)
+                run('install_name_tool', '-id', '@rpath/' + name, bundled)
+                _relink_bottle(app, bundled, tag, scratch, cellar, {}, inventory)
+                for rp in rpaths(bundled):
+                    run('install_name_tool', '-delete_rpath', rp, bundled)
+                notices = app / 'Contents/Resources/ThirdPartyLicenses' / f'{formula}-{keg.name}'
+                for notice in keg.glob('*'):
+                    if notice.is_file() and re.match(r'(LICEN[CS]E|COPYING|NOTICE|AUTHORS)', notice.name, re.I):
+                        notices.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(notice, notices / notice.name)
+                inventory[str(bundled.relative_to(app))] = {
+                    'source': str(source), 'bottle': f'{formula} {tag}',
+                    'sha256_before_relink': hashlib.sha256(source.read_bytes()).hexdigest()}
+            mapped = '@loader_path/' + os.path.relpath(bundled, path.parent)
+        if mapped != dep:
+            run('install_name_tool', '-change', dep, mapped, path)
+
+
+def retarget(app, tag, inventory, scratch):
+    """Troca binários do Homebrew feitos para um macOS mais novo pelas garrafas de `tag`.
+
+    O Homebrew deste Mac instala garrafas do macOS dele; a mesma fórmula tem
+    garrafas para versões anteriores. Cada binário é achado no Cellar pelo UUID
+    (install_name_tool não o altera), substituído pelo da garrafa e religado
+    com os mesmos caminhos que o original já tinha dentro do pacote."""
+    floor = BOTTLE_TAG_MACOS[tag]
+    cellar = Path(run(shutil.which('brew'), '--cellar').strip())
+    index = None
+    for path in machos(app):
+        if version_tuple(min_os(path)) <= version_tuple(floor):
+            continue
+        if index is None:
+            index = _cellar_by_name(cellar)
+        uuid = _uuid(path)
+        origin = next((c for c in index.get(path.name, []) if _uuid(c) == uuid), None)
+        if origin is None:
+            raise RuntimeError(f'No Homebrew origin for {path.relative_to(app)} (needs macOS {min_os(path)})')
+        formula, version = origin.relative_to(cellar).parts[:2]
+        relative = origin.relative_to(cellar / formula / version)
+        replacement = _bottle_keg(formula, tag, scratch) / relative
+        if not replacement.is_file():
+            raise RuntimeError(f'{relative} missing from the {tag} bottle of {formula}')
+
+        own_id = run('otool', '-D', path).splitlines()[1:]
+        by_name = {Path(d).name: d for d in deps(path)}
+        old_rpaths = rpaths(path)
+        mode = path.stat().st_mode
+        path.unlink()
+        shutil.copyfile(replacement, path)
+        os.chmod(path, mode | stat.S_IWUSR)
+        if own_id:
+            run('install_name_tool', '-id', own_id[0], path)
+        _relink_bottle(app, path, tag, scratch, cellar, by_name, inventory)
+        for rp in rpaths(path):
+            run('install_name_tool', '-delete_rpath', rp, path)
+        for rp in dict.fromkeys(old_rpaths):
+            run('install_name_tool', '-add_rpath', rp, path)
+        if version_tuple(min_os(path)) > version_tuple(floor):
+            raise RuntimeError(f'{relative} from the {tag} bottle still needs macOS {min_os(path)}')
+        # 'source' continua apontando o Cellar, de onde saem as licenças.
+        inventory[str(path.relative_to(app))] = {
+            'source': str(origin), 'bottle': f'{formula} {tag}',
+            'sha256_before_relink': hashlib.sha256(replacement.read_bytes()).hexdigest()}
+
+
 def dependency_dirs(input_app, build_dir=None, extra=()):
     # A árvore de build acompanha --input; o cache fornece o prefixo SDL real.
     build = Path(build_dir).resolve() if build_dir else Path(input_app).resolve().parent.parent
@@ -350,6 +486,8 @@ def main():
     parser.add_argument('--identity', default='-', help='Installed Developer ID identity, or - for local ad-hoc signature')
     parser.add_argument('--entitlements', type=Path, help='Reviewed entitlements for Developer ID / WebEngine')
     parser.add_argument('--macdeployqt', default=shutil.which('macdeployqt'))
+    parser.add_argument('--bottle-tag', choices=sorted(BOTTLE_TAG_MACOS),
+                        help='Swap Homebrew binaries built for a newer macOS for the bottles of this tag (e.g. arm64_tahoe for macOS 26)')
     args = parser.parse_args()
     if args.audit_only:
         report = audit(args.audit_only.resolve())
@@ -380,6 +518,11 @@ def main():
     if not list(app.rglob('QtWebEngineProcess.app')):
         raise RuntimeError('QtWebEngine helper missing after deployment')
     inventory.update(vendor(app, extras))
+    if args.bottle_tag:
+        print(f'Swapping in {args.bottle_tag} bottles...', flush=True)
+        scratch = app.parent / ('.bottles-' + app.stem)
+        scratch.mkdir(exist_ok=True)
+        retarget(app, args.bottle_tag, inventory, scratch)
     print('Removing private debug paths from distribution binaries...', flush=True)
     strip_debug(app)
     print('Collecting notices and auditing Mach-O binaries...', flush=True)

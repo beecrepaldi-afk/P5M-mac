@@ -5,6 +5,7 @@
 #include <chiaki/base64.h>
 
 #include <stdio.h>
+#include <stdlib.h>
 
 static const char launchspec_fmt[] =
 	"{"
@@ -61,8 +62,36 @@ static const char launchspec_fmt[] =
 		"},"
 		"%s" // 7
 		"%s" // 8
-		"\"handshakeKey\":\"%s\"" // 9
+		"%s" // 9
+		"\"handshakeKey\":\"%s\"" // 10
 	"}";
+
+// P5M: teste de áudio multicanal. Com P5M_AUDIO_CHANNELS=n (0..4), declara no
+// launch spec o perfil de canais pedido e a lista de perfis aceitos, no mesmo
+// formato do app oficial. Perfis: 0 estéreo, 1 5.1, 2 7.1, 3 7.1.4, 4 estéreo.
+// Os bitrates (kbps) são palpite: 64 por par de canais, como o estéreo de hoje.
+static const char *p5m_audio_settings(char *buf, size_t buf_size)
+{
+	const char *env = getenv("P5M_AUDIO_CHANNELS");
+	if(!env || !*env)
+		return "";
+	unsigned long profile = strtoul(env, NULL, 10);
+	if(profile > 4)
+		return "";
+	static const unsigned channels[5] = { 2, 6, 8, 12, 2 };
+	int w = snprintf(buf, buf_size,
+		"\"audioChannelNumRP\":%lu,\"audioSettings\":{\"audioChannels\":[{\"name\":\"main\",\"fecMode\":1,\"settings\":[",
+		profile);
+	for(unsigned i = 0; i < 5 && w > 0 && (size_t)w < buf_size; i++)
+		w += snprintf(buf + w, buf_size - (size_t)w,
+			"%s{\"channels\":%u,\"sampleRate\":48000,\"samplesPerFrame\":480,\"bitrate\":%u,\"isRawPcm\":false,\"profileEnumType\":%u}",
+			i ? "," : "", channels[i], channels[i] * 32, i);
+	if(w > 0 && (size_t)w < buf_size)
+		w += snprintf(buf + w, buf_size - (size_t)w, "]}]},");
+	if(w < 0 || (size_t)w >= buf_size)
+		return "";
+	return buf;
+}
 
 CHIAKI_EXPORT int chiaki_launchspec_format(char *buf, size_t buf_size, ChiakiLaunchSpec *launch_spec)
 {
@@ -85,10 +114,13 @@ CHIAKI_EXPORT int chiaki_launchspec_format(char *buf, size_t buf_size, ChiakiLau
 	else
 		extras[0] = extras[1] = extras[2] = "";
 
+	char audio_settings[768];
+	const char *audio = chiaki_target_is_ps5(launch_spec->target) ? p5m_audio_settings(audio_settings, sizeof(audio_settings)) : "";
+
 	int written = snprintf(buf, buf_size, launchspec_fmt,
 			launch_spec->width, launch_spec->height, launch_spec->max_fps,
 			launch_spec->bw_kbps_sent, launch_spec->mtu, launch_spec->rtt,
-			extras[0], extras[1], extras[2], handshake_key_b64);
+			extras[0], extras[1], extras[2], audio, handshake_key_b64);
 	if(written < 0 || written >= buf_size)
 		return -1;
 	return written;

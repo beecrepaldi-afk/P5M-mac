@@ -19,6 +19,7 @@ public:
     };
     std::array<Slot, Count> slots{};
     unsigned failed = 0, done = 0;
+    unsigned failed_in_row = 0; // P5M: para notar o controle que reconectou
     uint64_t sum_ns = 0, peak_ns = 0;
 
     MacHidAsyncReports() { for(auto &slot : slots) slot.owner = this; }
@@ -48,7 +49,8 @@ public:
         sum_ns += took;
         peak_ns = std::max(peak_ns, took);
         ++done;
-        if(!success) ++failed;
+        if(!success) { ++failed; ++failed_in_row; }
+        else failed_in_row = 0;
     }
     void submissionFailed(Slot &slot)
     {
@@ -56,6 +58,7 @@ public:
             return;
         slot.busy = false;
         ++failed;
+        ++failed_in_row;
     }
 
     // Close/Unschedule não garantem cancelamento. Se faltou callback, o

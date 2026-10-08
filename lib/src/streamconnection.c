@@ -63,7 +63,7 @@ static void p5m_bitrate_janela(ChiakiStreamConnection *sc, int32_t alvo, double 
 	relatos++;
 	if(agora - inicio_ms < 10000)
 		return;
-	CHIAKI_LOGE(sc->log, "P5M: bitrate 10s: asked %u kbps; console target %d..%d (last %d, session max %d); "
+	CHIAKI_LOGI(sc->log, "P5M: bitrate 10s: asked %u kbps; console target %d..%d (last %d, session max %d); "
 			"received %.1f Mbps avg, %.1f max (session max %.1f); %u reports, rtt max %.4f, loss max %lld",
 			(unsigned)sc->session->connect_info.video_profile.bitrate,
 			alvo_min, alvo_max, alvo_ultimo, alvo_sessao,
@@ -113,6 +113,65 @@ static void stream_connection_takion_cb(ChiakiTakionEvent *event, void *user);
 static void stream_connection_takion_data(ChiakiStreamConnection *stream_connection, ChiakiTakionMessageDataType data_type, uint8_t *buf, size_t buf_size);
 static void stream_connection_takion_data_protobuf(ChiakiStreamConnection *stream_connection, uint8_t *buf, size_t buf_size);
 static void stream_connection_takion_data_rumble(ChiakiStreamConnection *stream_connection, uint8_t *buf, size_t buf_size);
+// P5M: campos do pad info a partir do byte do índice do jogador (buf[8] na
+// v12+ com 0x19/0x1a bytes, buf[0] no formato antigo de 0x11/0x12). Leitura
+// do app oficial 9.5.0: +0 índice (nibble baixo; o alto, da v16+, o app
+// descarta), +1..3 RGB, +4 reset de movimento (só ==1), +5 correção de
+// inclinação, +6 banda morta do giroscópio, +7..10 preset (não DualSense),
+// +11 modo de vibração 1..5, +12 intensidade de vibração, +13 intensidade
+// dos gatilhos, +14 brilho da barra (0/1/2), +16 haptics nativo. As posições
+// +5, +6, +11, +14 e +16 vêm da ordem dos campos, não de leitura direta.
+typedef struct
+{
+	bool led, player_index, motion_reset, haptic_intensity, trigger_intensity, brightness;
+} P5MPadInfoChanges;
+
+static void p5m_pad_info_fields(ChiakiStreamConnection *sc, const uint8_t *p, P5MPadInfoChanges *f)
+{
+	if(sc->haptic_intensity != p[12])
+	{
+		sc->haptic_intensity = p[12];
+		f->haptic_intensity = true;
+	}
+	if(sc->trigger_intensity != p[13])
+	{
+		sc->trigger_intensity = p[13];
+		f->trigger_intensity = true;
+	}
+	if(p[4] == 1)
+		f->motion_reset = true;
+	uint8_t index = p[0] & 0x0f;
+	if(index != sc->player_index)
+	{
+		f->player_index = true;
+		sc->player_index = index;
+	}
+	if(memcmp(p + 1, sc->led_state, 3) != 0)
+	{
+		f->led = true;
+		memcpy(sc->led_state, p + 1, 3);
+	}
+	bool first = !sc->pad_extras_valid;
+	if(first || sc->led_brightness != p[14])
+	{
+		f->brightness = first || p[14] != sc->led_brightness;
+		sc->led_brightness = p[14];
+	}
+	if(first || sc->vibration_mode != p[11] || sc->native_haptics != p[16]
+		|| sc->tilt_correction != p[5] || sc->gyro_deadband != p[6])
+	{
+		sc->vibration_mode = p[11];
+		sc->native_haptics = p[16];
+		sc->tilt_correction = p[5];
+		sc->gyro_deadband = p[6];
+		CHIAKI_LOGI(sc->log, "[pad-info] index byte %#x, vibration mode %u, native haptics %u, tilt correction %u, gyro deadband %u, light bar brightness %u",
+			p[0], sc->vibration_mode, sc->native_haptics, sc->tilt_correction, sc->gyro_deadband, sc->led_brightness);
+	}
+	else if(f->brightness)
+		CHIAKI_LOGI(sc->log, "[pad-info] light bar brightness %u", sc->led_brightness);
+	sc->pad_extras_valid = true;
+}
+
 static void stream_connection_takion_data_pad_info(ChiakiStreamConnection *stream_connection, uint8_t *buf, size_t buf_size);
 static void stream_connection_takion_data_trigger_effects(ChiakiStreamConnection *stream_connection, uint8_t *buf, size_t buf_size);
 static ChiakiErrorCode stream_connection_send_big(ChiakiStreamConnection *stream_connection);
@@ -140,6 +199,8 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_stream_connection_init(ChiakiStreamConnecti
 	stream_connection->streaminfo_early_buf = NULL;
 	stream_connection->streaminfo_early_buf_size = 0;
 	stream_connection->player_index = 0;
+	stream_connection->pad_extras_valid = false;
+	stream_connection->led_brightness = 0;
 	memset(stream_connection->led_state, 0, sizeof(stream_connection->led_state));
 
 	stream_connection->haptic_intensity = Strong;
@@ -784,11 +845,7 @@ static char* DualSenseIntensity(ChiakiDualSenseEffectIntensity intensity)
 }
 static void stream_connection_takion_data_pad_info(ChiakiStreamConnection *stream_connection, uint8_t *buf, size_t buf_size)
 {
-	bool led_changed = false;
-	bool player_index_changed = false;
-	bool motion_reset = false;
-	bool haptic_intensity_changed = false;
-	bool trigger_intensity_changed = false;
+	P5MPadInfoChanges f = { 0 };
 
 	CHIAKI_LOGV(stream_connection->log, "Pad info packet: ");
 	chiaki_log_hexdump(stream_connection->log, CHIAKI_LOG_VERBOSE, buf, buf_size);
@@ -801,61 +858,15 @@ static void stream_connection_takion_data_pad_info(ChiakiStreamConnection *strea
 			// sequence number of feedback packet this is responding to
 			uint16_t feedback_packet_seq_num = ntohs(*(chiaki_unaligned_uint16_t *)(buf));
 			// int16_t unknown = ntohs(*(chiaki_unaligned_uint16_t *)(buf + 2));
-			uint32_t timestamp = ntohs(*(chiaki_unaligned_uint32_t *)(buf + 4));
-			if(stream_connection->haptic_intensity != buf[20])
-			{
-				stream_connection->haptic_intensity = buf[20];
-				haptic_intensity_changed = true;
-			}
-			if(stream_connection->trigger_intensity != buf[21])
-			{
-				stream_connection->trigger_intensity = buf[21];
-				trigger_intensity_changed = true;
-			}
-			if(buf[12])
-			{
-				motion_reset = true;
-				CHIAKI_LOGV(stream_connection->log, "StreamConnection received motion reset request in response to feedback packet with seqnum %"PRIu16"x , %"PRIu32" seconds after stream began", feedback_packet_seq_num, timestamp);
-			}
-			if(buf[8] != stream_connection->player_index)
-			{
-				player_index_changed = true;
-				stream_connection->player_index = buf[8];
-			}
-			if(memcmp(buf + 9, stream_connection->led_state, 3) != 0)
-			{
-				led_changed = true;
-				memcpy(stream_connection->led_state, buf + 9, 3);
-			}
+			uint32_t timestamp = ntohl(*(chiaki_unaligned_uint32_t *)(buf + 4));
+			p5m_pad_info_fields(stream_connection, buf + 8, &f);
+			(void)feedback_packet_seq_num; (void)timestamp;
 			break;
 		}
 		case 0x12: // Takion v20 appends one byte
 		case 0x11:
 		{
-			if(stream_connection->haptic_intensity != buf[12])
-			{
-				stream_connection->haptic_intensity = buf[12];
-				haptic_intensity_changed = true;
-			}
-			if(stream_connection->trigger_intensity != buf[13])
-			{
-				stream_connection->trigger_intensity = buf[13];
-				trigger_intensity_changed = true;
-			}
-			if(buf[4])
-			{
-				motion_reset = true;
-			}
-			if(buf[0] != stream_connection->player_index)
-			{
-				player_index_changed = true;
-				stream_connection->player_index = buf[0];
-			}
-			if(memcmp(buf + 1, stream_connection->led_state, 3) != 0)
-			{
-				led_changed = true;
-				memcpy(stream_connection->led_state, buf + 1, 3);
-			}
+			p5m_pad_info_fields(stream_connection, buf, &f);
 			break;
 		}
 		default:
@@ -865,14 +876,14 @@ static void stream_connection_takion_data_pad_info(ChiakiStreamConnection *strea
 			return;
 		}
 	}
-	if(motion_reset)
+	if(f.motion_reset)
 	{
 		CHIAKI_LOGI(stream_connection->log, "Setting motion control origin to current position");
 		ChiakiEvent event = { 0 };
 		event.type = CHIAKI_EVENT_MOTION_RESET;
 		chiaki_session_send_event(stream_connection->session, &event);
 	}
-	if(haptic_intensity_changed)
+	if(f.haptic_intensity)
 	{
 		CHIAKI_LOGI(stream_connection->log, "Set haptic intensity to: %s", DualSenseIntensity(stream_connection->haptic_intensity));
 		ChiakiEvent event = { 0 };
@@ -880,7 +891,7 @@ static void stream_connection_takion_data_pad_info(ChiakiStreamConnection *strea
 		event.intensity = stream_connection->haptic_intensity;
 		chiaki_session_send_event(stream_connection->session, &event);
 	}
-	if(trigger_intensity_changed)
+	if(f.trigger_intensity)
 	{
 		CHIAKI_LOGI(stream_connection->log, "Set adaptive trigger intensity to: %s", DualSenseIntensity(stream_connection->trigger_intensity));
 		ChiakiEvent event = { 0 };
@@ -888,7 +899,7 @@ static void stream_connection_takion_data_pad_info(ChiakiStreamConnection *strea
 		event.intensity = stream_connection->trigger_intensity;
 		chiaki_session_send_event(stream_connection->session, &event);
 	}
-	if(led_changed)
+	if(f.led)
 	{
 		CHIAKI_LOGV(stream_connection->log, "Set LED state to - red: %x, green: %x, blue: %x", stream_connection->led_state[0], stream_connection->led_state[1], stream_connection->led_state[2]);
 		ChiakiEvent event = { 0 };
@@ -896,7 +907,14 @@ static void stream_connection_takion_data_pad_info(ChiakiStreamConnection *strea
 		memcpy(event.led_state, stream_connection->led_state, 3);
 		chiaki_session_send_event(stream_connection->session, &event);
 	}
-	if(player_index_changed)
+	if(f.brightness)
+	{
+		ChiakiEvent event = { 0 };
+		event.type = CHIAKI_EVENT_LED_BRIGHTNESS;
+		event.led_brightness = stream_connection->led_brightness;
+		chiaki_session_send_event(stream_connection->session, &event);
+	}
+	if(f.player_index)
 	{
 		CHIAKI_LOGV(stream_connection->log, "Set player index to - %d", stream_connection->player_index);
 		ChiakiEvent event = { 0 };
@@ -935,6 +953,112 @@ static void stream_connection_takion_data_handle_disconnect(ChiakiStreamConnecti
 	free(stream_connection->remote_disconnect_reason);
 	stream_connection->remote_disconnect_reason = strdup(reason);
 	chiaki_cond_signal(&stream_connection->state_cond);
+}
+
+// P5M: envia um AUDIOSTATE (Takion 15+) com o tipo e os dados dados.
+static void p5m_send_audio_state(ChiakiStreamConnection *stream_connection, tkproto_AudioStatePayload_AudioStateType type,
+		uint8_t *data, size_t data_size, const char *what)
+{
+	tkproto_TakionMessage msg;
+	memset(&msg, 0, sizeof(msg));
+	msg.type = tkproto_TakionMessage_PayloadType_AUDIOSTATE;
+	msg.has_audio_state = true;
+	msg.audio_state.audio_state_type = type;
+	ChiakiPBBuf buf_data = { data_size, data };
+	msg.audio_state.audio_state_data.arg = &buf_data;
+	msg.audio_state.audio_state_data.funcs.encode = chiaki_pb_encode_buf;
+
+	uint8_t buf[48];
+	pb_ostream_t stream = pb_ostream_from_buffer(buf, sizeof(buf));
+	if(!pb_encode(&stream, tkproto_TakionMessage_fields, &msg))
+	{
+		CHIAKI_LOGE(stream_connection->log, "[audio-channels] %s: protobuf encoding failed", what);
+		return;
+	}
+	ChiakiErrorCode err = chiaki_takion_send_message_data(&stream_connection->takion, 1, 9, buf, stream.bytes_written, NULL);
+	CHIAKI_LOGI(stream_connection->log, "[audio-channels] sent %s: %s", what, chiaki_error_string(err));
+	chiaki_log_hexdump(stream_connection->log, CHIAKI_LOG_INFO, buf, stream.bytes_written);
+}
+
+// P5M: teste de áudio multicanal. Com P5M_AUDIO_CHANNELS=n (perfil 0..4: 0 estéreo,
+// 1 5.1, 2 7.1, 3 7.1.4, 4 estéreo) faz o que o app oficial faz ao receber o
+// STREAMINFO: AUDIOSTATE FLAGS com 9 bytes. O inteiro de 32 bits no byte 1 é
+// availableBits; o app manda 3 e zeros no resto. Hipótese em teste: availableBits diz
+// quais bits de flag valem e o inteiro no byte 5 traz os valores. P5M_AUDIO_MASK e
+// P5M_AUDIO_FLAGS (hexa) trocam os dois. Depois, CHANNELNUM = n.
+static void p5m_send_audio_channels(ChiakiStreamConnection *stream_connection)
+{
+	const char *env = getenv("P5M_AUDIO_CHANNELS");
+	if(!env || !*env)
+		return;
+	if(stream_connection->takion.version < 15)
+	{
+		CHIAKI_LOGI(stream_connection->log, "[audio-channels] Takion %u has no AUDIOSTATE, skipping", (unsigned)stream_connection->takion.version);
+		return;
+	}
+	unsigned long profile = strtoul(env, NULL, 10);
+	uint32_t mask = 0x3;
+	const char *mask_env = getenv("P5M_AUDIO_MASK");
+	if(mask_env && *mask_env)
+		mask = (uint32_t)strtoul(mask_env, NULL, 16);
+	// Acima de 0xff só com o recurso 16 (Takion 18+); o app força 0xff nos outros.
+	if(mask > 0xff && stream_connection->takion.version < 18)
+		mask = 0xff;
+	uint32_t values = 0;
+	const char *values_env = getenv("P5M_AUDIO_FLAGS");
+	if(values_env && *values_env)
+		values = (uint32_t)strtoul(values_env, NULL, 16);
+
+	uint8_t flags[9];
+	memset(flags, 0, sizeof(flags));
+	for(int i = 0; i < 4; i++)
+	{
+		flags[1 + i] = (uint8_t)((mask >> (8 * i)) & 0xff);
+		flags[5 + i] = (uint8_t)((values >> (8 * i)) & 0xff);
+	}
+	char what[64];
+	snprintf(what, sizeof(what), "FLAGS availableBits=%#x values=%#x", (unsigned)mask, (unsigned)values);
+	p5m_send_audio_state(stream_connection, tkproto_AudioStatePayload_AudioStateType_FLAGS, flags, sizeof(flags), what);
+
+	uint8_t channels = (uint8_t)profile;
+	snprintf(what, sizeof(what), "CHANNELNUM=%u", (unsigned)channels);
+	p5m_send_audio_state(stream_connection, tkproto_AudioStatePayload_AudioStateType_CHANNELNUM, &channels, 1, what);
+}
+
+// P5M: mensagens que o P5M ainda não trata vão para o diário (3 por tipo), para
+// ver o que o console manda nas versões novas.
+static void p5m_log_unhandled(ChiakiStreamConnection *stream_connection, int type, uint8_t *buf, size_t buf_size)
+{
+	if(type == tkproto_TakionMessage_PayloadType_HEARTBEAT)
+		return;
+	static uint8_t seen[64];
+	size_t idx = type >= 0 && type < 64 ? (size_t)type : 63;
+	if(seen[idx] >= 3)
+		return;
+	seen[idx]++;
+	CHIAKI_LOGI(stream_connection->log, "[unhandled] StreamConnection msg.type == %d, %zu bytes", type, buf_size);
+	chiaki_log_hexdump(stream_connection->log, CHIAKI_LOG_INFO, buf, buf_size > 128 ? 128 : buf_size);
+}
+
+// P5M: lista as faixas de áudio do STREAMINFO (campo 7), só para o diário.
+static bool p5m_decode_audio_channel(pb_istream_t *stream, const pb_field_t *field, void **arg)
+{
+	ChiakiStreamConnection *stream_connection = *arg;
+	tkproto_AudioChannelPayload ch;
+	memset(&ch, 0, sizeof(ch));
+	uint8_t header[64];
+	ChiakiPBDecodeBuf header_buf = { sizeof(header), 0, header };
+	ch.audio_header.arg = &header_buf;
+	ch.audio_header.funcs.decode = chiaki_pb_decode_buf;
+	if(!pb_decode(stream, tkproto_AudioChannelPayload_fields, &ch))
+	{
+		CHIAKI_LOGW(stream_connection->log, "[audio-channels] failed to decode audio_channel entry");
+		return false;
+	}
+	CHIAKI_LOGI(stream_connection->log, "[audio-channels] streaminfo audio_channel type=%u raw_pcm=%d header %zu bytes:",
+		(unsigned)ch.audio_channel_type, ch.has_is_raw_pcm ? (int)ch.is_raw_pcm : -1, header_buf.size);
+	chiaki_log_hexdump(stream_connection->log, CHIAKI_LOG_INFO, header, header_buf.size);
+	return true;
 }
 
 static void stream_connection_takion_data_idle(ChiakiStreamConnection *stream_connection, uint8_t *buf, size_t buf_size)
@@ -984,6 +1108,7 @@ static void stream_connection_takion_data_idle(ChiakiStreamConnection *stream_co
 		CHIAKI_LOGV(stream_connection->log, "StreamConnection received streaminfo ack");
 		break;
 	default:
+		p5m_log_unhandled(stream_connection, (int)msg.type, buf, buf_size);
 		break;
 	}
 }
@@ -1194,6 +1319,8 @@ static void stream_connection_takion_data_expect_streaminfo(ChiakiStreamConnecti
 	decode_resolutions_context.video_profiles_count = 0;
 	msg.stream_info_payload.resolution.arg = &decode_resolutions_context;
 	msg.stream_info_payload.resolution.funcs.decode = pb_decode_resolution;
+	msg.stream_info_payload.audio_channel.arg = stream_connection;
+	msg.stream_info_payload.audio_channel.funcs.decode = p5m_decode_audio_channel;
 
 	pb_istream_t stream = pb_istream_from_buffer(buf, buf_size);
 	bool r = pb_decode(&stream, tkproto_TakionMessage_fields, &msg);
@@ -1236,7 +1363,8 @@ static void stream_connection_takion_data_expect_streaminfo(ChiakiStreamConnecti
 	// TODO: do some checks?
 
 	stream_connection_send_streaminfo_ack(stream_connection);
-	
+	p5m_send_audio_channels(stream_connection);
+
 	ChiakiErrorCode err = stream_connection_send_controller_connection(stream_connection);
 	if(err != CHIAKI_ERR_SUCCESS)
 	{
@@ -1268,7 +1396,7 @@ static bool chiaki_pb_encode_zero_encrypted_key(pb_ostream_t *stream, const pb_f
 	return pb_encode_string(stream, data, sizeof(data));
 }
 
-#define LAUNCH_SPEC_JSON_BUF_SIZE 1024
+#define LAUNCH_SPEC_JSON_BUF_SIZE 2048
 
 static ChiakiErrorCode stream_connection_send_big(ChiakiStreamConnection *stream_connection)
 {
@@ -1300,6 +1428,9 @@ static ChiakiErrorCode stream_connection_send_big(ChiakiStreamConnection *stream
 	launch_spec_json_size += 1; // we also want the trailing 0
 
 	CHIAKI_LOGV(stream_connection->log, "LaunchSpec: %s", launch_spec_buf.json);
+	if(getenv("P5M_AUDIO_CHANNELS"))
+		CHIAKI_LOGI(stream_connection->log, "[audio-channels] launch spec %d bytes, audioSettings %s", launch_spec_json_size,
+			strstr(launch_spec_buf.json, "\"audioSettings\"") ? "included" : "missing");
 
 	uint8_t launch_spec_json_enc[LAUNCH_SPEC_JSON_BUF_SIZE];
 	memset(launch_spec_json_enc, 0, (size_t)launch_spec_json_size);
@@ -1349,7 +1480,7 @@ static ChiakiErrorCode stream_connection_send_big(ChiakiStreamConnection *stream
 	msg.big_payload.ecdh_sig.arg = &ecdh_sig_buf;
 	msg.big_payload.ecdh_sig.funcs.encode = chiaki_pb_encode_buf;
 
-	uint8_t buf[2048];
+	uint8_t buf[4096];
 	size_t buf_size;
 
 	pb_ostream_t stream = pb_ostream_from_buffer(buf, sizeof(buf));
@@ -1508,8 +1639,32 @@ static ChiakiErrorCode stream_connection_send_disconnect(ChiakiStreamConnection 
 	return err;
 }
 
+// P5M: registra cada combinação nova de pacote de áudio (byte de tipo, codec,
+// tamanho da unidade), para ver se o console passa a mandar outra faixa.
+static void p5m_log_audio_kind(ChiakiStreamConnection *stream_connection, ChiakiTakionAVPacket *packet)
+{
+	static uint32_t seen[16];
+	static size_t seen_count;
+	if(stream_connection->takion.version < 12 || !packet->data)
+		return;
+	uint8_t kind = packet->audio_kind;
+	uint8_t unit_size = packet->audio_single_unit ? 0 : chiaki_takion_av_packet_audio_unit_size(packet);
+	uint32_t key = ((uint32_t)kind << 16) | ((uint32_t)packet->codec << 8) | unit_size;
+	for(size_t i = 0; i < seen_count; i++)
+		if(seen[i] == key)
+			return;
+	if(seen_count < sizeof(seen) / sizeof(seen[0]))
+		seen[seen_count++] = key;
+	CHIAKI_LOGI(stream_connection->log, "[audio-packets] new audio packet kind 0x%02x (low nibble %u) codec %u unit size %u, units %u+%u fec, %zu bytes",
+		kind, kind & 0xf, packet->codec, unit_size,
+		chiaki_takion_av_packet_audio_source_units_count(packet),
+		chiaki_takion_av_packet_audio_fec_units_count(packet), packet->data_size);
+}
+
 static void stream_connection_takion_av(ChiakiStreamConnection *stream_connection, ChiakiTakionAVPacket *packet)
 {
+	if(!packet->is_video)
+		p5m_log_audio_kind(stream_connection, packet);
 	chiaki_gkcrypt_decrypt(stream_connection->gkcrypt_remote, packet->key_pos + CHIAKI_GKCRYPT_BLOCK_SIZE, packet->data, packet->data_size);
 
 	if(packet->is_video)

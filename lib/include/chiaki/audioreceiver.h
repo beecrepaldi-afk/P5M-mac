@@ -45,6 +45,10 @@ typedef struct chiaki_audio_receiver_t
 		size_t buf_size;
 	} jitter_buffer[8];
 	size_t jitter_buffer_count;
+	ChiakiAudioHeader header; // P5M: último cabeçalho entregue, para trocar o número de canais
+	bool header_valid;
+	uint16_t single_unit_prefix; // P5M: últimos 2 bytes antes do Opus multicanal
+	unsigned single_unit_prefix_logs;
 } ChiakiAudioReceiver;
 
 CHIAKI_EXPORT ChiakiErrorCode chiaki_audio_receiver_init(ChiakiAudioReceiver *audio_receiver, struct chiaki_session_t *session, ChiakiPacketStats *packet_stats);

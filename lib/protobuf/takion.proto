@@ -38,6 +38,7 @@ message TakionMessage {
         MICCONNECTION = 30;
         TAKIONPROTOCOLREQUEST = 31;
         TAKIONPROTOCOLREQUESTACK = 32;
+        AUDIOSTATE = 33;
     }
     
     optional BigPayload big_payload = 2;
@@ -70,6 +71,7 @@ message TakionMessage {
     optional MicConnectionPayload mic_connection_payload = 30;
     optional TakionProtocolRequestPayload takion_protocol_request = 31;
     optional TakionProtocolRequestAckPayload takion_protocol_request_ack = 32;
+    optional AudioStatePayload audio_state = 33;
 }
 
 message EventCode {
@@ -458,4 +460,22 @@ message SenkushaClientMtuCommand {
     required uint32 mtu_req = 2;
     required bool state = 3;
     optional uint32 mtu_down = 4;
+}
+
+// P5M: from the official app's descriptor (Takion 15+). The client tells the
+// console about its audio setup; the official Mac app only sends CHANNELNUM
+// with one byte of data.
+message AudioStatePayload {
+    required AudioStateType audio_state_type = 1;
+    enum AudioStateType {
+        FULL = 0;
+        FLAGS = 1;
+        ANGLE = 2;
+        HRTF = 3;
+        TVCONFIG = 4;
+        PORTSTATES = 5;
+        CHANNELNUM = 6;
+    }
+
+    optional bytes audio_state_data = 2;
 }

@@ -19,6 +19,13 @@ typedef struct chiaki_opus_decoder_t
 {
 	ChiakiLog *log;
 	struct OpusDecoder *opus_decoder;
+	struct OpusMSDecoder *ms_decoder; // P5M: multicanal (5.1/7.1), criado no primeiro pacote
+	bool ms_pending;
+	// P5M: medição por canal no multicanal, para descobrir a ordem (LFE = só graves).
+	double ch_sum_sq[12];
+	double ch_lf_sum_sq[12];
+	double ch_lp[12];
+	uint64_t ch_samples;
 	ChiakiAudioHeader audio_header;
 	int16_t *pcm_buf;
 	size_t pcm_buf_size;

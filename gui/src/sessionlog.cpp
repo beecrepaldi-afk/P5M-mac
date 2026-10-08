@@ -40,7 +40,11 @@ SessionLog::SessionLog(StreamSession *session, uint32_t level_mask, const QStrin
 		}
 	}
 
+#ifdef P5M_MAC_VERSION
+	CHIAKI_LOGI(&log, "P5M " P5M_MAC_VERSION " (chiaki-ng " CHIAKI_VERSION ")");
+#else
 	CHIAKI_LOGI(&log, "Chiaki Version " CHIAKI_VERSION);
+#endif
 }
 
 SessionLog::~SessionLog()

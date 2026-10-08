@@ -106,6 +106,10 @@ DialogView {
               options: [qsTr("Raw track"), qsTr("Apple Core Haptics"), qsTr("Rumble only")],
               get: () => Chiaki.settings.macBluetoothHaptics,
               set: (i) => Chiaki.settings.macBluetoothHaptics = i },
+            { kind: "link", label: qsTr("PS button opens the Game Overlay"),
+              shown: () => Qt.platform.os === "osx",
+              hint: qsTr("macOS can keep the PS button for itself. Open the setting and let apps handle it, so the press only goes to the PS5."),
+              action: () => { if (!Chiaki.openControllerHomeButtonSettings()) root.showInfoDialog(qsTr("PS button"), qsTr("Open System Settings > Game Controllers and set the Home button to let apps handle it. A controller must be connected.")); } },
         ];
         case "general": return [
             { kind: "choice", label: qsTr("When the stream ends"),

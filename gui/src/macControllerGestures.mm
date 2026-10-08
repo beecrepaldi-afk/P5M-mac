@@ -18,6 +18,36 @@ static void disableGestures(GCController *controller)
 	}
 	qCInfo(chiakiGui) << "Controller" << QString::fromNSString(controller.vendorName ?: @"?")
 	                  << "system gestures disabled; were bound:" << bound;
+	// macOS 27: the user decides whether the Home (PS) button follows the app's
+	// preference. With the system default, macOS still opens the Game Overlay.
+	const int in_app = controllerHomeButtonInAppAction();
+	if (in_app == 0)
+		qCWarning(chiakiGui) << "PS button: macOS keeps its own action in apps (Game Overlay); "
+		                        "change it in System Settings > Game Controllers so the press only reaches the console";
+	else if (in_app != -2)
+		qCInfo(chiakiGui) << "PS button in-app setting" << in_app << "(1 = follows P5M, -1 = unreadable)";
+}
+
+int controllerHomeButtonInAppAction()
+{
+	if (@available(macOS 27.0, *)) {
+		GCControllerHomeButtonSettingsManager *manager = [[GCControllerHomeButtonSettingsManager alloc] init];
+		NSError *error = nil;
+		return (int)[manager readControllerHomeButtonInAppActionWithError:&error];
+	}
+	return -2;
+}
+
+bool openControllerHomeButtonSettings()
+{
+	if (@available(macOS 27.0, *)) {
+		GCControllerHomeButtonSettingsManager *manager = [[GCControllerHomeButtonSettingsManager alloc] init];
+		NSError *error = nil;
+		if ([manager openControllerHomeButtonSettingsForActivity:GCControllerHomeButtonSettingsCustomizeInAppActionActivity error:&error])
+			return true;
+		qCWarning(chiakiGui) << "Could not open the PS button settings:" << QString::fromNSString(error.localizedDescription ?: @"?");
+	}
+	return false;
 }
 
 void disableControllerSystemGestures()

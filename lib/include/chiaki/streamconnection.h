@@ -52,6 +52,13 @@ typedef struct chiaki_stream_connection_t
 	uint8_t player_index;
 	ChiakiDualSenseEffectIntensity haptic_intensity;
 	ChiakiDualSenseEffectIntensity trigger_intensity;
+	// P5M: campos do pad info que o chiaki ignorava (app oficial 9.5.0)
+	bool pad_extras_valid;
+	uint8_t led_brightness;   // 0 = 100%, 1 = 50%, 2 = 25%
+	uint8_t vibration_mode;   // 1..5
+	uint8_t native_haptics;
+	uint8_t tilt_correction;
+	uint8_t gyro_deadband;
 	ChiakiFeedbackSender feedback_sender;
 	ChiakiCongestionControl congestion_control;
 	/**
