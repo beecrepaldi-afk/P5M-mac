@@ -4,24 +4,32 @@ import QtQuick.Controls.Material
 
 import org.streetpea.chiaking
 
-Rectangle {
+import "p5m"
+
+// Connecting over PSN (or registering through it), in the P5M waiting panel:
+// four steps on the bar, plain words for each, and a clear way out on errors.
+Item {
     id: view
     property bool allowClose: false
     property bool cancelling: false
-    property bool textVisible: true
     property bool registOnly: false
     property list<Item> restoreFocusItems
-    color: "black"
-
-    StackView.onActivated: infoLabel.visible = false
+    readonly property string consoleName: Chiaki.connectingConsole() || qsTr("your PS5")
 
     function stop() {
         if (!allowClose)
             return;
         allowClose = false;
         cancelling = true;
-        infoLabel.text = qsTr("Cancelling connection with console over PSN ...");
+        panel.cancelable = false;
+        panel.status = qsTr("Cancelling…");
         Chiaki.psnCancel(false);
+    }
+
+    function fail(title, text) {
+        panel.title = title;
+        panel.failText = text;
+        panel.failed = true;
     }
 
     function grabInput(item) {
@@ -38,86 +46,25 @@ Rectangle {
             item.forceActiveFocus(Qt.TabFocusReason);
     }
 
-    Keys.onEscapePressed: view.stop()
-
-    Shortcut {
-        sequence: "Ctrl+Q"
-        onActivated: view.stop()
+    Keys.onEscapePressed: {
+        if (panel.failed)
+            root.showMainView();
+        else
+            view.stop();
     }
 
-    MouseArea {
+    ConnectingScreen {
+        id: panel
         anchors.fill: parent
-        enabled: view.allowClose
-        acceptedButtons: Qt.RightButton
-        onClicked: view.stop()
-    }
-
-    Label {
-        id: infoLabel
-        anchors.centerIn: parent
-        opacity: textVisible ? 1.0: 0.0
-        visible: opacity
-        text: qsTr("Establishing connection with console over PSN ...")
-        Behavior on opacity { NumberAnimation { duration: 250 } }
-    }
-
-    Item {
-        anchors {
-            top: parent.verticalCenter
-            left: parent.left
-            right: parent.right
-            bottom: parent.bottom
-        }
-
-        BusyIndicator {
-            id: spinner
-            anchors.centerIn: parent
-            width: 70
-            height: width
-        }
-
-        Label {
-            id: closeMessageLabel
-            anchors {
-                top: spinner.bottom
-                horizontalCenter: spinner.horizontalCenter
-                topMargin: 30
-            }
-            opacity: (textVisible && !cancelling) ? 1.0: 0.0
-            visible: opacity
-            text: {
-                var typeString = registOnly ? qsTr("automatic registration") : qsTr("remote connection via PSN")
-                qsTr("Press %1 to cancel %2").arg(Chiaki.controllers.length ? (root.controllerButton("circle").includes("deck") ? "B" : "Circle") : "escape or right-click").arg(typeString)
-            }
-        }
-
-        Label {
-            id: errorTitleLabel
-            anchors {
-                bottom: spinner.top
-                horizontalCenter: spinner.horizontalCenter
-            }
-            font.pixelSize: 24
-            visible: text
-            onVisibleChanged: {
-                if (visible) {
-                    textVisible = false
-                    view.allowClose = false
-                    view.grabInput(errorTitleLabel)
-                }
-            }
-            Keys.onReturnPressed: root.showMainView()
-            Keys.onEscapePressed: root.showMainView()
-        }
-
-        Label {
-            id: errorTextLabel
-            anchors {
-                top: errorTitleLabel.bottom
-                horizontalCenter: errorTitleLabel.horizontalCenter
-                topMargin: 10
-            }
-        }
+        section: view.registOnly ? qsTr("Register") : qsTr("Remote play")
+        title: view.registOnly ? qsTr("Registering %1").arg(view.consoleName)
+                               : qsTr("Connecting to %1").arg(view.consoleName)
+        status: qsTr("Reaching PlayStation Network…")
+        stepCount: 4
+        step: 0
+        cancelable: false
+        onCancelRequested: view.stop()
+        onCloseRequested: root.showMainView()
     }
 
     Timer {
@@ -125,15 +72,14 @@ Rectangle {
         interval: 1500
         running: true
         onTriggered: {
-            view.allowClose = true
-            infoLabel.visible = infoLabel.opacity
+            view.allowClose = true;
+            panel.cancelable = !view.cancelling && !panel.failed;
         }
     }
 
     Timer {
-        id: failTimer
+        id: doneTimer
         interval: 2000
-        running: false
         onTriggered: root.showMainView()
     }
 
@@ -142,21 +88,27 @@ Rectangle {
         parent: Overlay.overlay
         x: Math.round((root.width - width) / 2)
         y: Math.round((root.height - height) / 2)
-        title: qsTr("Console Login PIN")
+        title: qsTr("Console login PIN")
         modal: true
         closePolicy: Popup.NoAutoClose
         standardButtons: Dialog.Ok | Dialog.Cancel
+        padding: 28
+        background: Rectangle {
+            radius: 30
+            border.width: 1
+            border.color: Qt.rgba(1, 1, 1, 60 / 255)
+            gradient: Gradient {
+                GradientStop { position: 0; color: Theme.panelTop }
+                GradientStop { position: 1; color: Theme.panelBottom }
+            }
+        }
         onAboutToShow: {
             standardButton(Dialog.Ok).enabled = Qt.binding(function() {
                 return pinField.acceptableInput;
             });
-            textVisible = false
             view.grabInput(pinField);
         }
-        onClosed: {
-            textVisible = true
-            view.releaseInput()
-        }
+        onClosed: view.releaseInput()
         onAccepted: Chiaki.enterPin(pinField.text)
         onRejected: Chiaki.stopSession(false)
         Material.roundedScale: Material.MediumScale
@@ -176,67 +128,83 @@ Rectangle {
     Connections {
         target: Chiaki
 
-        function onConnectStateChanged() 
+        function onConnectStateChanged()
         {
             switch(Chiaki.connectState)
             {
+                case Chiaki.PsnConnectState.WaitingForInternet:
+                    panel.status = qsTr("Waiting for an internet connection…");
+                    panel.step = 0;
+                    break
+                case Chiaki.PsnConnectState.InitiatingConnection:
+                    panel.status = qsTr("Reaching PlayStation Network…");
+                    panel.step = 0;
+                    break
                 case Chiaki.PsnConnectState.LinkingConsole:
-                    infoLabel.text = registOnly ? qsTr("Registering PlayStation console with chiaki-ng ...") : qsTr("Linking chiaki-ng with PlayStation console ...")
-                    view.allowClose = false
+                    panel.status = view.registOnly ? qsTr("Registering this Mac with the PS5…")
+                                                   : qsTr("Linking with %1 through PSN…").arg(view.consoleName);
+                    panel.step = 1;
+                    view.allowClose = false;
+                    panel.cancelable = false;
                     break
                 case Chiaki.PsnConnectState.RegisteringConsole:
                     view.registOnly = true;
                     break
                 case Chiaki.PsnConnectState.RegistrationFinished:
-                    infoLabel.text = qsTr("Successfully registered console")
-                    failTimer.restart()
+                    panel.status = qsTr("Registered. You can play now.");
+                    panel.step = 4;
+                    doneTimer.restart();
                     break
                 case Chiaki.PsnConnectState.DataConnectionStart:
-                    infoLabel.text = qsTr("Console Linked ... Establishing data connection with console over PSN ...")
-                    view.allowClose = true
+                    panel.status = qsTr("Opening the video connection. Away from home this can take a few seconds.");
+                    panel.step = 2;
+                    view.allowClose = true;
+                    panel.cancelable = true;
                     break
                 case Chiaki.PsnConnectState.DataConnectionFinished:
-                    view.allowClose = false
+                    panel.status = qsTr("Starting the picture…");
+                    panel.step = 3;
+                    view.allowClose = false;
+                    panel.cancelable = false;
                     break
                 case Chiaki.PsnConnectState.ConnectFailed:
-                    if(!cancelling)
-                        infoLabel.text = qsTr("Connection over PSN failed closing ...")
-                    failTimer.running = true
+                    if(!view.cancelling)
+                        view.fail(qsTr("Couldn't connect to %1").arg(view.consoleName),
+                                  qsTr("The connection over PSN dropped. Check the internet here and try again."));
+                    else
+                        doneTimer.restart();
                     break
                 case Chiaki.PsnConnectState.ConnectFailedStart:
-                    if(!cancelling)
-                        infoLabel.text = qsTr("PSN couldn't establish connection with PlayStation. Please try again ...")
-                    failTimer.running = true
+                    if(!view.cancelling)
+                        view.fail(qsTr("Couldn't reach %1").arg(view.consoleName),
+                                  qsTr("PlayStation Network couldn't reach the PS5. It must be in rest mode with \"Stay Connected to the Internet\" turned on (Settings › System › Power Saving › Features Available in Rest Mode)."));
+                    else
+                        doneTimer.restart();
                     break
                 case Chiaki.PsnConnectState.ConnectFailedConsoleUnreachable:
-                    if(!cancelling)
-                        infoLabel.text = qsTr("Couldn't contact PlayStation over established connection, likely unsupported network type")
-                    failTimer.running = true
-                    break
-                case Chiaki.PsnConnectState.WaitingForInternet:
-                    infoLabel.text = qsTr("Establishing Internet Connection to PSN...")
+                    if(!view.cancelling)
+                        view.fail(qsTr("This network blocks the connection"),
+                                  qsTr("The PS5 answered through PSN, but this network doesn't let the direct connection through (common on hotel or work Wi-Fi). Try another network, or your phone's hotspot."));
+                    else
+                        doneTimer.restart();
                     break
             }
         }
 
-        function onSessionChanged() 
+        function onSessionChanged()
         {
-            if (!Chiaki.session) {
-                if (errorTitleLabel.text)
-                    failTimer.start();
-                else if(!failTimer.running)
-                    root.showMainView();
-            }
+            // Leave by ourselves only when nothing went wrong: an error stays
+            // on screen until Close.
+            if (!Chiaki.session && !panel.failed && !doneTimer.running)
+                root.showMainView();
         }
 
         function onSessionError(title, text)
         {
-            errorTitleLabel.text = title;
-            errorTextLabel.text = text;
-            closeTimer.start();
+            view.fail(title, text);
         }
 
-        function onSessionPinDialogRequested() 
+        function onSessionPinDialogRequested()
         {
             if (sessionPinDialog.opened)
                 return;

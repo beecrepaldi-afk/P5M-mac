@@ -55,6 +55,40 @@ static MunitResult test_av_packet_parse(const MunitParameter params[], void *use
 }
 
 
+// Takion v20 is the v12 layout with 8 bytes after the type byte; the same packet must parse the same.
+static MunitResult test_av_packet_parse_v20(const MunitParameter params[], void *user)
+{
+	uint8_t v12[] = {
+			0x2, 0x0, 0x2d, 0x0, 0x5, 0x0, 0xc0, 0x1c, 0x1, 0x3, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,
+			0xe4, 0x10, 0x3, 0x67, 0x0, 0x29, 0xf3, 0x2f, 0x98, 0xf6, 0x99, 0x82, 0x83, 0x78, 0xdb, 0x29,
+			0x43, 0xa9, 0xe5, 0x88
+	};
+	uint8_t v20[sizeof(v12) + CHIAKI_TAKION_EXT_HEADER_SIZE];
+	v20[0] = v12[0];
+	for(size_t i=0; i<CHIAKI_TAKION_EXT_HEADER_SIZE; i++)
+		v20[1 + i] = (uint8_t)(0xa0 + i);
+	memcpy(v20 + 1 + CHIAKI_TAKION_EXT_HEADER_SIZE, v12 + 1, sizeof(v12) - 1);
+
+	ChiakiKeyState key_state;
+	chiaki_key_state_init(&key_state);
+	ChiakiTakionAVPacket a, b;
+	munit_assert_int(chiaki_takion_v12_av_packet_parse(&a, &key_state, v12, sizeof(v12)), ==, CHIAKI_ERR_SUCCESS);
+	chiaki_key_state_init(&key_state);
+	munit_assert_int(chiaki_takion_v20_av_packet_parse(&b, &key_state, v20, sizeof(v20)), ==, CHIAKI_ERR_SUCCESS);
+
+	munit_assert(b.is_video);
+	munit_assert_uint16(b.packet_index, ==, a.packet_index);
+	munit_assert_uint16(b.frame_index, ==, a.frame_index);
+	munit_assert_uint16(b.unit_index, ==, a.unit_index);
+	munit_assert_uint16(b.units_in_frame_total, ==, a.units_in_frame_total);
+	munit_assert_uint16(b.units_in_frame_fec, ==, a.units_in_frame_fec);
+	munit_assert_uint32(b.codec, ==, a.codec);
+	munit_assert_uint64(b.key_pos, ==, a.key_pos);
+	munit_assert_ptr_equal(b.data, v20 + (a.data - v12) + CHIAKI_TAKION_EXT_HEADER_SIZE);
+	munit_assert_size(b.data_size, ==, a.data_size);
+	return MUNIT_OK;
+}
+
 static MunitResult test_av_packet_parse_real_video(const MunitParameter params[], void *user)
 {
 #include "takion_av_packet_parse_real_video.inl"
@@ -199,6 +233,14 @@ MunitTest tests_takion[] = {
 	{
 		"/av_packet_parse",
 		test_av_packet_parse,
+		NULL,
+		NULL,
+		MUNIT_TEST_OPTION_NONE,
+		NULL
+	},
+	{
+		"/av_packet_parse_v20",
+		test_av_packet_parse_v20,
 		NULL,
 		NULL,
 		MUNIT_TEST_OPTION_NONE,

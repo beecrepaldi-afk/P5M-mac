@@ -8,6 +8,7 @@ import QtQuick.Dialogs
 import org.streetpea.chiaking
 
 import "controls" as C
+import "p5m"
 
 DialogView {
     enum Console {
@@ -16,10 +17,46 @@ DialogView {
     }
     property int selectedConsole: SettingsDialog.Console.PS5
     property bool quitControllerMapping: true
+    // Opened from a home category: "screen", "stream", "controller", "general".
+    property string initialPage: ""
+    // Metal draws the stream itself: libplacebo's options do nothing there.
+    readonly property bool metal: Chiaki.settings.rendererBackend === 2
     id: dialog
     title: qsTr("Settings")
     header: qsTr("* Defaults in () to right of value or marked with (Default)")
     buttonVisible: false
+    initialFocusItem: categoryList
+    extraHints: [{ button: "L1/R1", key: "", text: qsTr("Category") }]
+    // Circle inside a page goes back to the category list first.
+    backHandler: function() {
+        if (categoryList.activeFocus)
+            return false;
+        categoryList.forceActiveFocus(Qt.TabFocusReason);
+        return true;
+    }
+
+    // The 9 pages, grouped like P5M on the Quest. page = StackLayout index.
+    property ListModel categories: ListModel {
+        ListElement { section: qsTr("Play"); title: qsTr("Consoles"); page: 4 }
+        ListElement { section: qsTr("Play"); title: qsTr("Remote play (PSN)"); page: 7 }
+        ListElement { section: qsTr("Screen"); title: qsTr("Video"); page: 1 }
+        ListElement { section: qsTr("Stream"); title: qsTr("Stream quality"); page: 2 }
+        ListElement { section: qsTr("Stream"); title: qsTr("Audio and Wi-Fi"); page: 3 }
+        ListElement { section: qsTr("Controller"); title: qsTr("Controllers"); page: 6 }
+        ListElement { section: qsTr("Controller"); title: qsTr("Keyboard"); page: 5 }
+        ListElement { section: qsTr("General"); title: qsTr("General"); page: 0 }
+        ListElement { section: qsTr("General"); title: qsTr("Profiles and backup"); page: 8 }
+    }
+    function categoryIndexForPage(page) {
+        for (let i = 0; i < categories.count; ++i)
+            if (categories.get(i).page === page)
+                return i;
+        return 0;
+    }
+    Component.onCompleted: {
+        const pages = { screen: 1, stream: 2, controller: 6, general: 0, consoles: 4, remote: 7 };
+        categoryList.currentIndex = categoryIndexForPage(initialPage in pages ? pages[initialPage] : 4);
+    }
     function flickContainsItem(flick, item) {
         let current = item;
         while (current) {
@@ -136,13 +173,19 @@ DialogView {
             return;
         switch (event.key) {
         case Qt.Key_PageUp:
-            bar.decrementCurrentIndex();
-            event.accepted = true;
-            break;
         case Qt.Key_PageDown:
-            bar.incrementCurrentIndex();
+        {
+            // L1/R1: previous/next category; inside a page, stay in pages.
+            const inPage = !categoryList.activeFocus;
+            const next = categoryList.currentIndex + (event.key === Qt.Key_PageUp ? -1 : 1);
+            if (next >= 0 && next < categories.count) {
+                categoryList.currentIndex = next;
+                if (inPage)
+                    Qt.callLater(dialog.focusCurrentTabFirstItem);
+            }
             event.accepted = true;
             break;
+        }
         case Qt.Key_Up:
         {
             const flick = activeSettingsFlick();
@@ -165,13 +208,60 @@ DialogView {
     }
 
     Item {
+        // Categories, D-pad reachable. Right or Cross enters the page.
+        ListView {
+            id: categoryList
+            anchors {
+                top: parent.top
+                left: parent.left
+                bottom: parent.bottom
+                leftMargin: Theme.gutter
+                topMargin: 4
+            }
+            width: 260
+            spacing: 8
+            clip: true
+            model: categories
+            focus: true
+            highlightFollowsCurrentItem: false
+            onCurrentIndexChanged: {
+                if (currentIndex >= 0)
+                    bar.currentIndex = categories.get(currentIndex).page;
+            }
+            Keys.onRightPressed: dialog.focusCurrentTabFirstItem()
+            Keys.onReturnPressed: dialog.focusCurrentTabFirstItem()
+            section.property: "section"
+            section.delegate: SectionLabel {
+                required property string section
+                text: section
+            }
+            delegate: GlassButton {
+                required property string title
+                required property int index
+                width: ListView.view.width
+                text: title
+                focusPolicy: Qt.NoFocus
+                selected: ListView.isCurrentItem
+                // The list holds focus; show it on the current row.
+                FocusFrame {
+                    anchors.fill: parent
+                    shown: parent.ListView.isCurrentItem && categoryList.activeFocus
+                }
+                onClicked: {
+                    categoryList.currentIndex = index;
+                    categoryList.forceActiveFocus(Qt.MouseFocusReason);
+                }
+            }
+        }
+
         TabBar {
             id: bar
+            visible: false
+            height: 0
             anchors {
                 top: parent.top
                 left: parent.left
                 right: parent.right
-                topMargin: 5
             }
             TabButton {
                 id: general
@@ -422,16 +512,14 @@ DialogView {
 
         StackLayout {
             anchors {
-                top: bar.bottom
-                left: parent.left
+                top: parent.top
+                left: categoryList.right
                 right: parent.right
                 bottom: parent.bottom
+                leftMargin: 24
             }
             currentIndex: bar.currentIndex
-            onCurrentIndexChanged: {
-                dialog.focusCurrentTabFirstItem()
-                Qt.callLater(dialog.ensureActiveFocusVisible)
-            }
+            onCurrentIndexChanged: Qt.callLater(dialog.ensureActiveFocusVisible)
 
             Item {
                 // General
@@ -718,7 +806,7 @@ DialogView {
 
                             Label {
                                 Layout.alignment: Qt.AlignRight
-                                text: qsTr("(L1+R1+L3+R3)")
+                                text: qsTr("(R1+L3+R3)")
                             }
                         }
                     }
@@ -927,9 +1015,11 @@ DialogView {
                     Label {
                         Layout.alignment: Qt.AlignRight
                         text: qsTr("Render Preset:")
+                        visible: !dialog.metal
                     }
 
                     C.ComboBox {
+                        visible: !dialog.metal
                         Layout.preferredWidth: 520
                         model: [qsTr("Fast"), qsTr("Default"), qsTr("High Quality"), qsTr("High Quality + Spatial Upscaling"), qsTr("High Quality + Advanced Spatial Upscaling"), qsTr("Custom")]
                         currentIndex: Chiaki.settings.videoPreset
@@ -949,14 +1039,17 @@ DialogView {
                     Label {
                         Layout.alignment: Qt.AlignRight
                         text: qsTr("(High Quality)")
+                        visible: !dialog.metal
                     }
 
                     Label {
                         Layout.alignment: Qt.AlignRight
                         text: qsTr("Frame Delivery:")
+                        visible: !dialog.metal
                     }
 
                     C.ComboBox {
+                        visible: !dialog.metal
                         Layout.preferredWidth: 400
                         model: [qsTr("Direct Mapping"), qsTr("Frame Queue")]
                         currentIndex: Chiaki.settings.directFrameMapping ? 0 : 1
@@ -973,14 +1066,17 @@ DialogView {
                     Label {
                         Layout.alignment: Qt.AlignRight
                         text: qsTr("(Direct Mapping)")
+                        visible: !dialog.metal
                     }
 
                     Label {
                         Layout.alignment: Qt.AlignRight
                         text: qsTr("Frame Mixer:")
+                        visible: !dialog.metal
                     }
 
                     C.ComboBox {
+                        visible: !dialog.metal
                         Layout.preferredWidth: 400
                         model: [qsTr("None"), qsTr("Oversample"), qsTr("Hermite"), qsTr("Linear"), qsTr("Cubic")]
                         enabled: !Chiaki.settings.directFrameMapping
@@ -991,6 +1087,7 @@ DialogView {
                     Label {
                         Layout.alignment: Qt.AlignRight
                         text: qsTr("(None)")
+                        visible: !dialog.metal
                     }
 
                     Label {
@@ -1000,7 +1097,8 @@ DialogView {
 
                     C.ComboBox {
                         Layout.preferredWidth: 400
-                        model: [qsTr("Vulkan"), qsTr("OpenGL")]
+                        model: Qt.platform.os === "osx" ? [qsTr("Vulkan"), qsTr("OpenGL"), qsTr("Metal")] : [qsTr("Vulkan"), qsTr("OpenGL")]
+                        lastInFocusChain: dialog.metal
                         currentIndex: Chiaki.settings.rendererBackend
                         onActivated: (index) => {
                             if (index === Chiaki.settings.rendererBackend)
@@ -1013,7 +1111,7 @@ DialogView {
 
                     Label {
                         Layout.alignment: Qt.AlignRight
-                        text: qsTr("(Vulkan)")
+                        text: Qt.platform.os === "osx" ? qsTr("(Metal)") : qsTr("(Vulkan)")
                     }
 
                     Label {
@@ -1037,7 +1135,7 @@ DialogView {
                     Label {
                         Layout.alignment: Qt.AlignRight
                         text: qsTr("Custom Renderer Settings")
-                        visible: Chiaki.window.videoPreset == ChiakiWindow.VideoPreset.Custom
+                        visible: !dialog.metal && Chiaki.window.videoPreset == ChiakiWindow.VideoPreset.Custom
                     }
 
                     C.Button {
@@ -1045,14 +1143,15 @@ DialogView {
                         text: qsTr("Open")
                         onClicked: root.showPlaceboSettingsDialog()
                         Material.roundedScale: Material.SmallScale
-                        visible: Chiaki.window.videoPreset == ChiakiWindow.VideoPreset.Custom
+                        visible: !dialog.metal && Chiaki.window.videoPreset == ChiakiWindow.VideoPreset.Custom
                     }
 
-                    Label { visible: Chiaki.window.videoPreset == ChiakiWindow.VideoPreset.Custom }
+                    Label { visible: !dialog.metal && Chiaki.window.videoPreset == ChiakiWindow.VideoPreset.Custom }
 
                     Label {
                         Layout.alignment: Qt.AlignRight
                         text: qsTr("Display Settings")
+                        visible: !dialog.metal
                     }
 
                     C.Button {
@@ -1061,9 +1160,10 @@ DialogView {
                         onClicked: root.showDisplaySettingsDialog()
                         Material.roundedScale: Material.SmallScale
                         lastInFocusChain: true
+                        visible: !dialog.metal
                     }
 
-                    Label {}
+                    Label { visible: !dialog.metal }
                     }
                 }
             }
@@ -1231,7 +1331,7 @@ DialogView {
                     C.ComboBox {
                         id: resolutionRemotePS5
                         Layout.preferredWidth: 400
-                        model: [qsTr("360p"), qsTr("540p"), qsTr("720p (Default)"), qsTr("1080p")]
+                        model: [qsTr("360p"), qsTr("540p"), qsTr("720p"), qsTr("1080p (Default)")]
                         currentIndex: Chiaki.settings.resolutionRemotePS5 - 1
                         onActivated: (index) => {
                             Chiaki.settings.resolutionRemotePS5 = index + 1
@@ -1406,7 +1506,7 @@ DialogView {
                             case 1: rate = 2; break; // 360p
                             case 2: rate = 6; break; // 540p
                             case 3: rate = 10; break; // 720p
-                            case 4: rate = 15; break; // 1080p
+                            case 4: rate = 30; break; // 1080p (P5M: 30 at home)
                             }
                             return rate;
                         }
@@ -2216,11 +2316,11 @@ DialogView {
 
                         Button {
                             id: resetAllKeys
-                            text: "Reset All Keys"
+                            text: qsTr("Reset All Keys")
                             Layout.alignment: Qt.AlignRight
                             property bool firstInFocusChain: true
                             property bool lastInFocusChain: false
-                            onClicked: Chiaki.settings.clearKeyMapping()
+                            onClicked: root.showConfirmDialog(qsTr("Reset All Keys"), qsTr("Put every key back to its default?"), () => Chiaki.settings.clearKeyMapping())
                             Material.roundedScale: Material.SmallScale
                             Material.background: visualFocus ? Material.accent : undefined
                             onActiveFocusChanged: if (activeFocus) keysFlick.ensureItemVisible(this)
@@ -2550,7 +2650,7 @@ DialogView {
                             Layout.alignment: Qt.AlignHCenter
                             id: controllerMappingChange
                             firstInFocusChain: true
-                            text: "Change Controller Mapping"
+                            text: qsTr("Change Controller Mapping")
                             onClicked: controllerMappingDialog.show({
                                 reset: false
                             });
@@ -2558,7 +2658,7 @@ DialogView {
                         C.Button {
                             Layout.alignment: Qt.AlignHCenter
                             id: controllerMappingReset
-                            text: "Reset Controller Mapping"
+                            text: qsTr("Reset Controller Mapping")
                             onClicked: controllerMappingDialog.show({
                                 reset: true
                             });
@@ -2801,39 +2901,24 @@ DialogView {
                         RowLayout {
                             spacing: 10
                             Layout.alignment: Qt.AlignHCenter
+                            visible: Qt.platform.os === "osx"
                             Label {
                                 Layout.alignment: Qt.AlignRight
-                                text: qsTr("True Haptics Intensity:")
+                                text: qsTr("DualSense Bluetooth Haptics:")
                             }
 
-                            C.Slider {
-                                id: hapticOverride
-                                Layout.preferredWidth: 250
-                                from: 0
-                                to: 2
-                                stepSize: 0.1
-                                value: Chiaki.settings.hapticOverride
-                                onMoved: Chiaki.settings.hapticOverride = value;
+                            C.ComboBox {
+                                id: macBluetoothHaptics
+                                Layout.preferredWidth: 400
+                                model: [qsTr("Raw track (HID report)"), qsTr("Apple Core Haptics"), qsTr("Rumble only")]
+                                currentIndex: Chiaki.settings.macBluetoothHaptics
+                                onActivated: (index) => Chiaki.settings.macBluetoothHaptics = index;
                                 lastInFocusChain: true
-                                Label {
-                                    anchors {
-                                        left: parent.right
-                                        verticalCenter: parent.verticalCenter
-                                        leftMargin: 10
-                                    }
-                                    text: {
-                                        if(parent.value > 0.99 && parent.value < 1.01)
-                                            qsTr("console setting")
-                                        else
-                                            (parent.value * 100).toFixed(0) + qsTr(" % console setting")
-                                    }
-                                }
                             }
 
                             Label {
                                 Layout.alignment: Qt.AlignRight
-                                Layout.leftMargin: 250
-                                text: qsTr("(console setting)")
+                                text: qsTr("(Raw track)")
                             }
                         }
                     }

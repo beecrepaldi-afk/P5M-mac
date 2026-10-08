@@ -20,7 +20,13 @@ int main(int argc, char *argv[]) { return real_main(argc, argv); }
 #include <discoverymanager.h>
 #include <qmlmainwindow.h>
 #include <QApplication>
+#include <QStyleHints>
 #include <QtTypes>
+#ifdef Q_OS_MACOS
+#include "macControllerGestures.h"
+#include "macStreamActivity.h"
+#include "macSettingsMigration.h"
+#endif
 
 #ifdef CHIAKI_ENABLE_CLI
 #include <chiaki-cli.h>
@@ -73,10 +79,17 @@ int real_main(int argc, char *argv[])
 	qRegisterMetaType<ChiakiRegistEventType>();
 	qRegisterMetaType<ChiakiLogLevel>();
 
+#ifdef Q_OS_MACOS
+	QGuiApplication::setOrganizationName("P5M");
+	QGuiApplication::setApplicationName("P5M");
+	QGuiApplication::setApplicationVersion(P5M_MAC_VERSION);
+	QGuiApplication::setApplicationDisplayName("P5M");
+#else
 	QGuiApplication::setOrganizationName("Chiaki");
 	QGuiApplication::setApplicationName("Chiaki");
 	QGuiApplication::setApplicationVersion(CHIAKI_VERSION);
 	QGuiApplication::setApplicationDisplayName("chiaki-ng");
+#endif
 #if defined(Q_OS_MACOS)
 	qputenv("QT_MTL_NO_TRANSACTION", "1");
 #endif
@@ -126,6 +139,14 @@ int real_main(int argc, char *argv[])
 	QApplication app(argc, argv);
 
 #ifdef Q_OS_MACOS
+	migrateMacSettings();
+	// macOS only puts text fields in the focus chain by default, so dialogs
+	// opened with nothing focused and the D-pad could not reach buttons,
+	// lists or dropdowns. The controller needs every control in the chain.
+	QGuiApplication::styleHints()->setTabFocusBehavior(Qt::TabFocusAllControls);
+	disableControllerSystemGestures();
+	installMacStreamThreadQos();
+	installMacFullscreenAutoHide();
 	QGuiApplication::setWindowIcon(QIcon(":/icons/chiaking_macos.svg"));
 #else
 	QGuiApplication::setWindowIcon(QIcon(":/icons/chiaking.svg"));

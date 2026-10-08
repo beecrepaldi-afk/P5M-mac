@@ -133,6 +133,28 @@ void QmlSettings::setHapticOverride(float override)
     emit hapticOverrideChanged();
 }
 
+int QmlSettings::macBluetoothHaptics() const
+{
+    return settings->GetMacBluetoothHaptics();
+}
+
+void QmlSettings::setMacBluetoothHaptics(int mode)
+{
+    settings->SetMacBluetoothHaptics(mode);
+    emit macBluetoothHapticsChanged();
+}
+
+bool QmlSettings::hdrOutput() const
+{
+    return settings->GetHdrOutputEnabled();
+}
+
+void QmlSettings::setHdrOutput(bool enabled)
+{
+    settings->SetHdrOutputEnabled(enabled);
+    emit hdrOutputChanged();
+}
+
 int QmlSettings::audioVideoDisabled() const
 {
     return static_cast<int>(settings->GetAudioVideoDisabled());
@@ -533,6 +555,28 @@ void QmlSettings::setAudioBufferSize(int size)
     emit audioBufferSizeChanged();
 }
 
+bool QmlSettings::macSpatialAudio() const
+{
+    return settings->GetMacSpatialAudio();
+}
+
+void QmlSettings::setMacSpatialAudio(bool enabled)
+{
+    settings->SetMacSpatialAudio(enabled);
+    emit macSpatialAudioChanged();
+}
+
+bool QmlSettings::macHeadTracking() const
+{
+    return settings->GetMacHeadTracking();
+}
+
+void QmlSettings::setMacHeadTracking(bool enabled)
+{
+    settings->SetMacHeadTracking(enabled);
+    emit macHeadTrackingChanged();
+}
+
 int QmlSettings::audioVolume() const
 {
     return settings->GetAudioVolume();
@@ -674,10 +718,16 @@ int QmlSettings::rendererBackend() const
 void QmlSettings::setRendererBackend(int backend)
 {
     if (backend < static_cast<int>(RenderBackend::Vulkan) ||
-        backend > static_cast<int>(RenderBackend::OpenGL)) {
+        backend > static_cast<int>(RenderBackend::Metal)) {
         qWarning() << "Ignoring invalid renderer backend value:" << backend;
         return;
     }
+#ifndef Q_OS_MACOS
+    if (backend == static_cast<int>(RenderBackend::Metal)) {
+        qWarning() << "Ignoring Metal renderer backend: only available on macOS";
+        return;
+    }
+#endif
 
     auto next_backend = static_cast<RenderBackend>(backend);
     if (settings->GetRenderBackend() == next_backend)
@@ -1892,6 +1942,8 @@ void QmlSettings::refreshAllKeys()
     emit logSanitizeChanged();
     emit vSyncEnabledChanged();
     emit hapticOverrideChanged();
+    emit macBluetoothHapticsChanged();
+    emit hdrOutputChanged();
     emit rumbleHapticsIntensityChanged();
     emit buttonsByPositionChanged();
     emit allowJoystickBackgroundEventsChanged();
@@ -1924,6 +1976,8 @@ void QmlSettings::refreshAllKeys()
     emit codecRemotePS5Changed();
     emit audioBufferSizeChanged();
     emit audioVolumeChanged();
+    emit macSpatialAudioChanged();
+    emit macHeadTrackingChanged();
     emit audioOutDeviceChanged();
     emit audioInDeviceChanged();
     emit wifiDroppedNotifChanged();

@@ -5,11 +5,18 @@ import QtQuick.Controls.Material
 
 import org.streetpea.chiaking
 
+import "p5m"
+
+// Home: "Play". Categories on the left (like P5M on the Quest), consoles on
+// the right. Everything is reachable with the D-pad; the face buttons are
+// shortcuts, shown on the focused console.
 Pane {
-    padding: 0
     id: consolePane
+    padding: 0
+    background: Item {}
+
     StackView.onActivated: {
-        forceActiveFocus(Qt.TabFocusReason);
+        hostsView.forceActiveFocus(Qt.TabFocusReason);
         if(!Chiaki.autoConnect && !root.initialAsk && !Chiaki.window.directStream)
         {
             root.initialAsk = true;
@@ -24,33 +31,26 @@ Pane {
             }
         }
     }
-    Keys.onUpPressed: {
-        if(hostsView.currentItem && hostsView.currentItem.visible)
-        {
-            hostsView.decrementCurrentIndex()
-            while(!hostsView.currentItem.visible)
-                hostsView.decrementCurrentIndex()
-        }
+
+    function confirmQuit() {
+        root.showConfirmDialog(qsTr("Quit"), qsTr("Are you sure you want to quit?"), () => Qt.quit());
     }
-    Keys.onDownPressed: {
-        if(hostsView.currentItem && hostsView.currentItem.visible)
-        {
-            hostsView.incrementCurrentIndex()
-            while(!hostsView.currentItem.visible)
-                 hostsView.incrementCurrentIndex()
-        }
+
+    Keys.onMenuPressed: root.showSettingsDialog()
+
+    Shortcut {
+        sequence: "Ctrl+,"
+        onActivated: root.showSettingsDialog()
     }
-    Keys.onMenuPressed: settingsButton.clicked()
-    Keys.onReturnPressed: if (hostsView.currentItem) hostsView.currentItem.connectToHost()
     Keys.onYesPressed: if (hostsView.currentItem) hostsView.currentItem.wakeUpHost()
     Keys.onNoPressed: if (hostsView.currentItem) hostsView.currentItem.deleteHost()
-    Keys.onEscapePressed: root.showConfirmDialog(qsTr("Quit"), qsTr("Are you sure you want to quit?"), () => Qt.quit())
+    Keys.onEscapePressed: confirmQuit()
     Keys.onPressed: (event) => {
         if (event.modifiers)
             return;
         switch (event.key) {
         case Qt.Key_PageUp:
-            if (hostsView.currentItem) hostsView.currentItem.setConsolePin();
+            if (hostsView.currentItem && hostsView.currentItem.registered) hostsView.currentItem.setConsolePin();
             event.accepted = true;
             break;
         case Qt.Key_PageDown:
@@ -68,370 +68,389 @@ Pane {
         }
     }
 
-    ToolBar {
-        id: toolBar
+    ColumnLayout {
         anchors {
-            top: parent.top
-            left: parent.left
-            right: parent.right
+            fill: parent
+            leftMargin: Theme.gutter
+            rightMargin: Theme.gutter
+            topMargin: 20
+            bottomMargin: 16
         }
-        height: 80
+        spacing: 0
 
         RowLayout {
-            anchors {
-                fill: parent
-                leftMargin: 10
-                rightMargin: 10
-            }
-
-            Button {
-                Layout.fillHeight: true
-                Layout.preferredWidth: 100
-                flat: true
-                text: "×"
-                font.pixelSize: 60
-                focusPolicy: Qt.NoFocus
-                onClicked: Qt.quit()
-                Material.roundedScale: Material.SmallScale
-            }
-
+            Layout.fillWidth: true
+            Layout.bottomMargin: 18
+            BrandHeader { screen: qsTr("Play") }
             Item { Layout.fillWidth: true }
-
-            Button {
-                Layout.fillHeight: true
-                Layout.preferredWidth: 350
-                flat: true
-                text: "Create Steam Shortcut"
-                focusPolicy: Qt.NoFocus
-                onClicked: root.showSteamShortcutDialog(false)
-                Material.roundedScale: Material.SmallScale
-                visible: typeof Chiaki.createSteamShortcut === "function"
-                Image {
-                    anchors {
-                        right: parent.right
-                        verticalCenter: parent.verticalCenter
-                        leftMargin: 12
-                    }
-                    width: 28
-                    height: 28
-                    sourceSize: Qt.size(width, height)
-                    source: "qrc:/icons/l3.svg"
-                }
-            }
-
-            Button {
-                Layout.fillHeight: true
-                Layout.preferredWidth: 400
-                flat: true
-                text: "Refresh PSN Hosts"
-                icon.source: "qrc:/icons/r1.svg"
-                focusPolicy: Qt.NoFocus
-                onClicked: Chiaki.refreshPsnToken();
-                Material.roundedScale: Material.SmallScale
-                visible: Chiaki.settings.psnAuthToken
-            }
-
-            Button {
-                Layout.fillHeight: true
-                Layout.preferredWidth: 400
-                flat: true
-                focusPolicy: Qt.NoFocus
-                Material.roundedScale: Material.SmallScale
-                visible: !Chiaki.settings.psnAuthToken
-            }
-
-            Button {
-                Layout.fillHeight: true
-                Layout.preferredWidth: 300
-                flat: true
-                text: "Add Manual Host"
-                focusPolicy: Qt.NoFocus
-                onClicked: root.showManualHostDialog()
-                Material.roundedScale: Material.SmallScale
-                Image {
-                    anchors {
-                        left: parent.left
-                        verticalCenter: parent.verticalCenter
-                        leftMargin: 12
-                    }
-                    width: 28
-                    height: 28
-                    sourceSize: Qt.size(width, height)
-                    source: "qrc:/icons/r3.svg"
-                }
-            }
-
-            Button {
-                id: settingsButton
-                Layout.fillHeight: true
-                Layout.preferredWidth: 100
-                flat: true
-                icon.source: "qrc:/icons/settings-20px.svg";
-                icon.width: 50
-                icon.height: 50
-                focusPolicy: Qt.NoFocus
-                onClicked: root.showSettingsDialog()
-                Material.roundedScale: Material.SmallScale
+            Text {
+                text: Qt.application.version
+                color: Theme.textMuted
+                font.pixelSize: Theme.hintSize
             }
         }
-    }
 
-    ListView {
-        id: hostsView
-        keyNavigationWraps: true
-        anchors {
-            top: toolBar.bottom
-            left: parent.left
-            right: parent.right
-            bottom: parent.bottom
-            bottomMargin: 50
-        }
-        clip: true
-        model: Chiaki.hosts
-        onCountChanged: {
-            if(!hostsView.currentItem)
-                hostsView.incrementCurrentIndex();
-            if(!hostsView.currentItem)
-                return;
-            if(!hostsView.currentItem.visible)
-            {
-                for(var i = 0; i < hostsView.count; i++)
-                {
-                    hostsView.incrementCurrentIndex()
-                    if(hostsView.currentItem.visible)
-                    {
-                        break;
-                    }
+        RowLayout {
+            Layout.fillWidth: true
+            Layout.fillHeight: true
+            spacing: 28
+
+            // Categories. Play is this screen; the rest open Settings there.
+            ColumnLayout {
+                id: nav
+                Layout.preferredWidth: 230
+                Layout.fillHeight: true
+                spacing: 8
+
+                GlassButton {
+                    id: navPlay
+                    Layout.fillWidth: true
+                    text: qsTr("Play")
+                    selected: true
+                    onClicked: hostsView.forceActiveFocus(Qt.TabFocusReason)
+                    KeyNavigation.down: navScreen
+                    KeyNavigation.right: hostsView
+                }
+                GlassButton {
+                    id: navScreen
+                    Layout.fillWidth: true
+                    text: qsTr("Screen")
+                    onClicked: root.showSettingsDialog("screen")
+                    KeyNavigation.up: navPlay
+                    KeyNavigation.down: navStream
+                    KeyNavigation.right: hostsView
+                }
+                GlassButton {
+                    id: navStream
+                    Layout.fillWidth: true
+                    text: qsTr("Stream")
+                    onClicked: root.showSettingsDialog("stream")
+                    KeyNavigation.up: navScreen
+                    KeyNavigation.down: navController
+                    KeyNavigation.right: hostsView
+                }
+                GlassButton {
+                    id: navController
+                    Layout.fillWidth: true
+                    text: qsTr("Controller")
+                    onClicked: root.showSettingsDialog("controller")
+                    KeyNavigation.up: navStream
+                    KeyNavigation.down: navGeneral
+                    KeyNavigation.right: hostsView
+                }
+                GlassButton {
+                    id: navGeneral
+                    Layout.fillWidth: true
+                    text: qsTr("General")
+                    glyph: "OPTIONS"
+                    onClicked: root.showSettingsDialog("general")
+                    KeyNavigation.up: navController
+                    KeyNavigation.down: navQuit
+                    KeyNavigation.right: hostsView
+                }
+                Item { Layout.fillHeight: true }
+                GlassButton {
+                    id: navQuit
+                    Layout.fillWidth: true
+                    text: qsTr("Quit")
+                    glyph: "circle"
+                    onClicked: consolePane.confirmQuit()
+                    KeyNavigation.up: navGeneral
+                    KeyNavigation.right: hostsView
                 }
             }
-        }
-        delegate: ItemDelegate {
-            visible: modelData.display
-            id: delegate
-            width: parent ? parent.width : 0
-            height: modelData.display ? 180 : 0
-            highlighted: ListView.isCurrentItem
-            onClicked: connectToHost()
 
-            function connectToHost() {
-                if(modelData.discovered)
-                    Chiaki.connectToHost(index, modelData.name);
-                else
-                    Chiaki.connectToHost(index);
-            }
+            ColumnLayout {
+                Layout.fillWidth: true
+                Layout.fillHeight: true
+                spacing: 0
 
-            function wakeUpHost() {
-                if(!modelData.discovered && !modelData.duid)
-                    Chiaki.wakeUpHost(index);
-            }
-
-            function deleteHost() {
-                if (modelData.manual)
-                    root.showConfirmDialog(qsTr("Delete Console"), qsTr("Are you sure you want to delete this console?"), () => {Chiaki.deleteHost(index)});
-                        
-                else if (modelData.discovered && !modelData.registered)
-                    root.showConfirmDialog(qsTr("Hide Console"), qsTr("Are you sure you want to hide this console?") + "\n\n" + qsTr("Note: You can unhide from the Consoles section of the Settings under Hidden Consoles"), () => Chiaki.hideHost(modelData.mac, modelData.name));
-
-            }
-
-            function setConsolePin() {
-                root.showConsolePinDialog(index);
-            }
-
-            RowLayout {
-                anchors {
-                    fill: parent
-                    leftMargin: 30
-                    rightMargin: 10
-                    topMargin: 10
-                    bottomMargin: 10
+                Text {
+                    text: qsTr("Let's play")
+                    color: Theme.text
+                    font.pixelSize: Theme.titleSize
+                    font.weight: Font.Light
                 }
-                spacing: 50
+                Text {
+                    Layout.fillWidth: true
+                    Layout.topMargin: 4
+                    Layout.bottomMargin: 16
+                    text: hostsView.visibleCount
+                        ? qsTr("Pick a console and press ✕. A PS5 in rest mode wakes up on its own.")
+                        : qsTr("Looking for consoles on your network… Your PS5 must be on or in rest mode, on the same network as this Mac.")
+                    color: Theme.textSecondary
+                    font.pixelSize: Theme.bodySize
+                    wrapMode: Text.WordWrap
+                }
 
-                Image {
+                ListView {
+                    id: hostsView
+                    Layout.fillWidth: true
                     Layout.fillHeight: true
-                    Layout.preferredWidth: 150
-                    fillMode: Image.PreserveAspectFit
-                    source: "image://svg/console-ps" + (modelData.ps5 ? "5" : "4") + (modelData.state == "standby" ? "#light_standby" : "#light_on")
-                    sourceSize: Qt.size(width, height)
-                }
+                    clip: true
+                    spacing: 10
+                    focus: true
+                    keyNavigationWraps: false
+                    model: Chiaki.hosts
+                    readonly property int visibleCount: {
+                        let n = 0;
+                        for (let i = 0; i < count; ++i)
+                            if (model[i] && model[i].display)
+                                n++;
+                        return n;
+                    }
 
-                Label {
-                    Layout.alignment: Qt.AlignLeft | Qt.AlignVCenter
-                    text: {
-                        let t = "";
-                        if (modelData.name)
-                            t += modelData.name + "\n";
-                        if (modelData.address)
-                            t += qsTr("Address: %1").arg(Chiaki.settings.streamerMode ? "hidden" : modelData.address);
-                        if (modelData.mac)
-                            t += "\n" + qsTr("ID: %1 (%2)").arg(Chiaki.settings.streamerMode ? "hidden" : modelData.mac).arg(modelData.registered ? qsTr("registered") : qsTr("unregistered"));
-                        if (modelData.duid)
-                        {
+                    function step(delta) {
+                        let i = currentIndex;
+                        for (let n = 0; n < count; ++n) {
+                            i += delta;
+                            if (i < 0 || i >= count)
+                                return false;
+                            if (model[i] && model[i].display) {
+                                currentIndex = i;
+                                return true;
+                            }
+                        }
+                        return false;
+                    }
+
+                    onCountChanged: {
+                        if (currentItem && currentItem.visible)
+                            return;
+                        currentIndex = -1;
+                        step(1);
+                    }
+
+                    Keys.onUpPressed: step(-1)
+                    Keys.onDownPressed: {
+                        if (!step(1))
+                            addButton.forceActiveFocus(Qt.TabFocusReason);
+                    }
+                    Keys.onLeftPressed: navPlay.forceActiveFocus(Qt.TabFocusReason)
+                    Keys.onReturnPressed: if (currentItem) currentItem.connectToHost()
+
+                    delegate: Item {
+                        id: delegate
+                        visible: modelData.display
+                        width: ListView.view ? ListView.view.width : 0
+                        height: modelData.display ? card.implicitHeight : 0
+                        readonly property bool focused: ListView.isCurrentItem && hostsView.activeFocus
+                        readonly property bool registered: modelData.registered
+                        readonly property bool remote: modelData.duid && !modelData.discovered
+                        readonly property bool canWake: modelData.registered && !modelData.duid && !modelData.discovered
+                        readonly property bool canRemove: modelData.manual || (modelData.discovered && !modelData.registered)
+
+                        function connectToHost() {
                             if(modelData.discovered)
-                                t += "\n" + qsTr("Automatic Registration Available");
+                                Chiaki.connectToHost(index, modelData.name);
                             else
-                                t += "\n" + qsTr("Remote Connection via PSN");
-                        } 
-                        else
-                        {
-                            t += "\n";
-                            if(modelData.discovered)
-                            {
-                                if(modelData.manual)
-                                    t += qsTr("discovered + manual")
-                                else
-                                    t += qsTr("discovered");
-                            }
-                            else
-                                t += qsTr("manual");
+                                Chiaki.connectToHost(index);
                         }
-                        return t;
+
+                        function wakeUpHost() {
+                            if(canWake)
+                                Chiaki.wakeUpHost(index);
+                        }
+
+                        function deleteHost() {
+                            if (modelData.manual)
+                                root.showConfirmDialog(qsTr("Delete Console"), qsTr("Are you sure you want to delete this console?"), () => {Chiaki.deleteHost(index)});
+                            else if (modelData.discovered && !modelData.registered)
+                                root.showConfirmDialog(qsTr("Hide Console"), qsTr("Are you sure you want to hide this console?") + "\n\n" + qsTr("Note: You can unhide from the Consoles section of the Settings under Hidden Consoles"), () => Chiaki.hideHost(modelData.mac, modelData.name));
+                        }
+
+                        function setConsolePin() {
+                            root.showConsolePinDialog(index);
+                        }
+
+                        Glass {
+                            id: card
+                            anchors.fill: parent
+                            implicitHeight: cardRow.implicitHeight + 28
+                            level: delegate.focused ? 2 : 1
+                            FocusFrame { shown: delegate.focused }
+
+                            MouseArea {
+                                anchors.fill: parent
+                                onClicked: {
+                                    hostsView.currentIndex = index;
+                                    hostsView.forceActiveFocus(Qt.MouseFocusReason);
+                                    delegate.connectToHost();
+                                }
+                            }
+
+                            RowLayout {
+                                id: cardRow
+                                anchors {
+                                    left: parent.left
+                                    right: parent.right
+                                    verticalCenter: parent.verticalCenter
+                                    leftMargin: 18
+                                    rightMargin: 18
+                                }
+                                spacing: 20
+
+                                Image {
+                                    Layout.preferredWidth: 84
+                                    Layout.preferredHeight: 84
+                                    fillMode: Image.PreserveAspectFit
+                                    source: "image://svg/console-ps" + (modelData.ps5 ? "5" : "4") + (modelData.state == "standby" ? "#light_standby" : "#light_on")
+                                    sourceSize: Qt.size(width, height)
+                                    opacity: modelData.state == "unknown" && !delegate.remote ? 0.5 : 1.0
+                                }
+
+                                ColumnLayout {
+                                    Layout.fillWidth: true
+                                    spacing: 4
+
+                                    Text {
+                                        Layout.fillWidth: true
+                                        text: modelData.name || modelData.address
+                                        color: Theme.text
+                                        font.pixelSize: 20
+                                        font.weight: Font.Medium
+                                        elide: Text.ElideRight
+                                    }
+                                    RowLayout {
+                                        spacing: 8
+                                        Rectangle {
+                                            implicitWidth: 9
+                                            implicitHeight: 9
+                                            radius: 4.5
+                                            color: statusText.color
+                                        }
+                                        Text {
+                                            id: statusText
+                                            text: {
+                                                if (delegate.remote)
+                                                    return qsTr("Remote, through PSN");
+                                                if (!modelData.registered)
+                                                    return modelData.duid ? qsTr("Not registered yet: press ✕ to register automatically")
+                                                                          : qsTr("Not registered yet: press ✕ to register");
+                                                if (modelData.state == "ready")
+                                                    return qsTr("Ready");
+                                                if (modelData.state == "standby")
+                                                    return qsTr("Rest mode");
+                                                return qsTr("Not found on the network");
+                                            }
+                                            color: {
+                                                if (delegate.remote)
+                                                    return Theme.active;
+                                                if (!modelData.registered)
+                                                    return Theme.warning;
+                                                if (modelData.state == "ready")
+                                                    return Theme.good;
+                                                if (modelData.state == "standby")
+                                                    return Theme.fair;
+                                                return Theme.textMuted;
+                                            }
+                                            font.pixelSize: Theme.bodySize
+                                        }
+                                    }
+                                    Text {
+                                        visible: text
+                                        text: modelData.discovered && modelData.app ? qsTr("Playing %1").arg(modelData.app) : ""
+                                        color: Theme.textSecondary
+                                        font.pixelSize: Theme.bodySize
+                                    }
+                                    // Technical details only on the focused card.
+                                    Text {
+                                        visible: delegate.focused && text
+                                        text: {
+                                            let parts = [];
+                                            if (modelData.address && modelData.address !== modelData.name)
+                                                parts.push(Chiaki.settings.streamerMode ? qsTr("address hidden") : modelData.address);
+                                            parts.push(modelData.ps5 ? "PS5" : "PS4");
+                                            if (modelData.manual)
+                                                parts.push(qsTr("added by hand"));
+                                            return parts.join("  ·  ");
+                                        }
+                                        color: Theme.textMuted
+                                        font.pixelSize: Theme.hintSize
+                                    }
+                                }
+
+                                // What the face buttons do here.
+                                ColumnLayout {
+                                    visible: delegate.focused
+                                    spacing: 6
+                                    Hint {
+                                        button: "cross"
+                                        key: "Return"
+                                        controller: Chiaki.controllers.length > 0
+                                        text: modelData.registered || delegate.remote ? qsTr("Play") : qsTr("Register")
+                                    }
+                                    Hint {
+                                        visible: delegate.canWake
+                                        button: "triangle"
+                                        controller: Chiaki.controllers.length > 0
+                                        text: qsTr("Wake up")
+                                    }
+                                    Hint {
+                                        visible: delegate.canRemove
+                                        button: "square"
+                                        controller: Chiaki.controllers.length > 0
+                                        text: modelData.manual ? qsTr("Delete") : qsTr("Hide")
+                                    }
+                                    Hint {
+                                        visible: modelData.registered
+                                        button: "L1"
+                                        controller: Chiaki.controllers.length > 0
+                                        text: qsTr("Console PIN")
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
 
-                Label {
-                    Layout.alignment: Qt.AlignLeft | Qt.AlignVCenter
-                    text: {
-                        let t = "";
-                        if(modelData.duid)
-                            return t;
-                        t += qsTr("State: %1").arg(modelData.state);
-                        if(!modelData.discovered)
-                            return t;
-                        if (modelData.app)
-                            t += "\n" + qsTr("App: %1").arg(modelData.app);
-                        if (modelData.titleId)
-                            t += "\n" + qsTr("Title ID: %1").arg(modelData.titleId);
-                        return t;
+                // Console actions, all reachable from the list with Down.
+                RowLayout {
+                    Layout.fillWidth: true
+                    Layout.topMargin: 12
+                    spacing: 10
+
+                    GlassButton {
+                        id: addButton
+                        text: qsTr("Add console by address")
+                        glyph: "R3"
+                        onClicked: root.showManualHostDialog()
+                        KeyNavigation.up: hostsView
+                        KeyNavigation.left: navPlay
+                        KeyNavigation.right: psnButton.visible ? psnButton : discoveryButton
                     }
+                    GlassButton {
+                        id: psnButton
+                        visible: Chiaki.settings.psnAuthToken
+                        text: qsTr("Refresh PSN consoles")
+                        glyph: "R1"
+                        onClicked: Chiaki.refreshPsnToken()
+                        KeyNavigation.up: hostsView
+                        KeyNavigation.left: addButton
+                        KeyNavigation.right: discoveryButton
+                    }
+                    GlassButton {
+                        id: discoveryButton
+                        text: qsTr("Search the network")
+                        value: Chiaki.discoveryEnabled ? qsTr("On") : qsTr("Off")
+                        valueColor: Chiaki.discoveryEnabled ? Theme.active : Theme.textSecondary
+                        onClicked: Chiaki.discoveryEnabled = !Chiaki.discoveryEnabled
+                        KeyNavigation.up: hostsView
+                        KeyNavigation.left: psnButton.visible ? psnButton : addButton
+                    }
+                    Item { Layout.fillWidth: true }
                 }
-
-                Item { Layout.fillWidth: true }
-
-                ColumnLayout {
-                    Layout.fillHeight: true
-                    spacing: 0
-
-                    Button {
-                        Layout.alignment: Qt.AlignCenter
-                        text: modelData.manual ? qsTr("Delete") : qsTr("Hide")
-                        flat: true
-                        padding: 20
-                        leftPadding: delegate.highlighted ? 50 : undefined
-                        focusPolicy: Qt.NoFocus
-                        visible: modelData.manual || (modelData.discovered && !modelData.registered)
-                        onClicked: delegate.deleteHost()
-                        Material.roundedScale: Material.SmallScale
-
-                        Image {
-                            anchors {
-                                left: parent.left
-                                verticalCenter: parent.verticalCenter
-                                leftMargin: 12
-                            }
-                            width: 28
-                            height: 28
-                            sourceSize: Qt.size(width, height)
-                            source: root.controllerButton("box")
-                            visible: delegate.highlighted
-                        }
-                    }
-
-                    Button {
-                        Layout.alignment: Qt.AlignCenter
-                        text: qsTr("Wake Up")
-                        flat: true
-                        padding: 20
-                        leftPadding: delegate.highlighted ? 50 : undefined
-                        visible: modelData.registered && !modelData.duid && !modelData.discovered
-                        focusPolicy: Qt.NoFocus
-                        onClicked: delegate.wakeUpHost()
-                        Material.roundedScale: Material.SmallScale
-
-                        Image {
-                            anchors {
-                                left: parent.left
-                                verticalCenter: parent.verticalCenter
-                                leftMargin: 12
-                            }
-                            width: 28
-                            height: 28
-                            sourceSize: Qt.size(width, height)
-                            source: root.controllerButton("pyramid")
-                            visible: delegate.highlighted
-                        }
-                    }
-
-                    Button {
-                        Layout.alignment: Qt.AlignCenter
-                        text: qsTr("Update Console Pin")
-                        flat: true
-                        padding: 20
-                        leftPadding: delegate.highlighted ? 50 : undefined
-                        visible: modelData.registered
-                        focusPolicy: Qt.NoFocus
-                        onClicked: delegate.setConsolePin()
-                        Material.roundedScale: Material.SmallScale
-
-                        Image {
-                            anchors {
-                                left: parent.left
-                                verticalCenter: parent.verticalCenter
-                                leftMargin: 12
-                            }
-                            width: 28
-                            height: 28
-                            sourceSize: Qt.size(width, height)
-                            source: "qrc:/icons/l1.svg"
-                            visible: delegate.highlighted
-                        }
-                    }
-                } 
-            } 
+            }
         }
-    }     
 
-    RoundButton {
-        anchors {
-            left: parent.left
-            bottom: parent.bottom
-            margins: 20
-        }
-        icon.source: "qrc:/icons/discover-" + (checked ? "" : "off-") + "24px.svg"
-        icon.width: 50
-        icon.height: 50
-        padding: 20
-        focusPolicy: Qt.NoFocus
-        checkable: true
-        checked: Chiaki.discoveryEnabled
-        onToggled: Chiaki.discoveryEnabled = !Chiaki.discoveryEnabled
-        Material.background: Material.accent
-    }
-
-    Label {
-        anchors {
-            right: parent.right
-            bottom: parent.bottom
-            margins: 20
-        }
-        text: Qt.application.version
-    }
-
-    Image {
-        id: logoImage
-        anchors.centerIn: parent
-        source: "qrc:/icons/chiaking-logo-white.svg"
-        sourceSize: Qt.size(Math.min(parent.width, parent.height) / 2, Math.min(parent.width, parent.height) / 2)
-
-        PropertyAnimation {
-            target: logoImage
-            property: "opacity"
-            from: 0.05
-            to: 0.20
-            duration: 1000
-            easing.type: Easing.OutCubic
-            running: true
+        HintBar {
+            Layout.topMargin: 14
+            hints: [
+                { button: "cross", key: "Return", text: qsTr("Select") },
+                { button: "circle", key: "Esc", text: qsTr("Quit") },
+                { button: "OPTIONS", key: "⌘,", text: qsTr("Settings") },
+                { button: Chiaki.settings.stringForStreamMenuShortcut() || "R1+L3+R3", key: "⌘O", text: qsTr("Menu while playing") },
+            ]
         }
     }
 }

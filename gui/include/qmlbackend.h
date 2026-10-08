@@ -15,6 +15,8 @@
 #include <QFutureWatcher>
 #include <QFuture>
 #include <QAtomicInteger>
+#include <QElapsedTimer>
+#include <QJsonObject>
 #ifdef CHIAKI_HAVE_WEBENGINE
 #include <QQuickWebEngineProfile>
 #include <QWebEngineUrlRequestInterceptor>
@@ -94,7 +96,25 @@ class QmlBackend : public QObject
     Q_PROPERTY(bool controllerMappingAltered READ controllerMappingAltered NOTIFY controllerMappingAlteredChanged)
     Q_PROPERTY(bool enableAnalogStickMapping READ enableAnalogStickMapping WRITE setEnableAnalogStickMapping NOTIFY enableAnalogStickMappingChanged)
 
+    Q_PROPERTY(QString systemModelStatus READ systemModelStatus NOTIFY systemIntegrationChanged)
+    Q_PROPERTY(QString sessionSummary READ sessionSummary NOTIFY systemIntegrationChanged)
+    Q_PROPERTY(QString sessionExplanation READ sessionExplanation NOTIFY systemIntegrationChanged)
+    Q_PROPERTY(bool systemExplanationBusy READ systemExplanationBusy NOTIFY systemIntegrationChanged)
+    Q_PROPERTY(bool hasSessionSummary READ hasSessionSummary NOTIFY systemIntegrationChanged)
+
 public:
+    QString systemModelStatus() const { return system_model_status; }
+    QString sessionSummary() const { return system_session_summary; }
+    QString sessionExplanation() const { return system_session_explanation; }
+    bool systemExplanationBusy() const { return system_explanation_busy; }
+    bool hasSessionSummary() const { return !system_session_metrics.isEmpty(); }
+    Q_INVOKABLE void refreshSystemModelStatus();
+    Q_INVOKABLE void explainLastSession();
+    Q_INVOKABLE void setSystemDiagnosticContext(bool visible);
+    Q_INVOKABLE void showSystemDiagnostics();
+    int runSystemAction(const QString &action, const QString &console_id);
+    void refreshSystemConsoles();
+    void captureSystemSessionMetrics(StreamSession *source);
 
     enum class PsnConnectState
     {
@@ -152,6 +172,8 @@ public:
     void finishAutoRegister(const ChiakiRegisteredHost &host);
 
     bool autoConnect() const;
+    // Name of the console being woken or connected to (for the waiting panel).
+    Q_INVOKABLE QString connectingConsole() const;
 
     void psnConnector();
 
@@ -171,7 +193,7 @@ public:
     void setIsAppActive();
 
     void profileChanged();
-    bool prepareFrameForPresentation(ChiakiFfmpegFrame &frame, bool use_opengl_renderer);
+    bool prepareFrameForPresentation(ChiakiFfmpegFrame &frame, bool use_opengl_renderer, bool use_metal_renderer);
     void prepareStartupPresentation(bool present_warmup);
     void applyStartupWindowSizing();
 
@@ -219,6 +241,8 @@ public:
 #endif
 
 signals:
+    void systemIntegrationChanged();
+    void systemDiagnosticsRequested();
     void sessionChanged(StreamSession *session);
     void psnConnect(StreamSession *session, const QString &duid, const bool &ps5);
     void showPsnView();
@@ -251,6 +275,15 @@ signals:
     void psnLoginAccountIdError(const QString &error);
 
 private:
+    QString system_model_status = QStringLiteral("Checking local model availability...");
+    QString system_session_summary = QStringLiteral("Play a session to collect a diagnostic summary.");
+    QString system_session_explanation;
+    bool system_explanation_busy = false;
+    bool system_diagnostic_visible = false;
+    QJsonObject system_session_metrics;
+    QElapsedTimer system_session_clock;
+    QHash<QString, QString> system_console_keys;
+
     struct DisplayServer {
         bool valid = false;
 

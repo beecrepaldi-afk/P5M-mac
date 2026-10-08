@@ -48,6 +48,13 @@ static void chiaki_opus_decoder_header(ChiakiAudioHeader *header, void *user)
 	opus_decoder_destroy(decoder->opus_decoder);
 	decoder->opus_decoder = NULL;
 
+	// O cabeçalho Sony não negocia streams nem ordem dos canais multicanal.
+	if(header->channels != 1 && header->channels != 2)
+	{
+		CHIAKI_LOGE(decoder->log, "Audio input has %u channels; Remote Play Opus multistream mapping is not negotiated, so surround decoding cannot be enabled safely", (unsigned)header->channels);
+		return;
+	}
+
 	int error;
 	decoder->opus_decoder = opus_decoder_create(header->rate, header->channels, &error);
 
@@ -58,7 +65,7 @@ static void chiaki_opus_decoder_header(ChiakiAudioHeader *header, void *user)
 		return;
 	}
 
-	CHIAKI_LOGI(decoder->log, "ChiakiOpusDecoder initialized");
+	CHIAKI_LOGI(decoder->log, "ChiakiOpusDecoder initialized: %u channels at %u Hz (PCM input preserved)", (unsigned)header->channels, (unsigned)header->rate);
 
 	size_t pcm_buf_size_required = chiaki_audio_header_frame_buf_size(header);
 	int16_t *pcm_buf_old = decoder->pcm_buf;
@@ -87,7 +94,7 @@ static void chiaki_opus_decoder_frame(uint8_t *buf, size_t buf_size, void *user)
 	ChiakiOpusDecoder *decoder = user;
 	if(!decoder->opus_decoder)
 	{
-		CHIAKI_LOGE(decoder->log, "Received audio frame, but opus decoder is not initialized");
+		// A falha do cabeçalho já informa o motivo; não repetir por pacote.
 		return;
 	}
 

@@ -2,6 +2,8 @@ import QtQuick
 import QtQuick.Controls
 import QtQuick.Controls.Material
 
+import "../p5m"
+
 Button {
     property bool firstInFocusChain: false
     property bool lastInFocusChain: false
@@ -18,6 +20,9 @@ Button {
     }
 
     Keys.onPressed: (event) => {
+        // Keys this control does not handle (Circle/Esc, L1/R1...) go on
+        // to the dialog.
+        event.accepted = false;
         switch (event.key) {
         case Qt.Key_Up:
             if (!firstInFocusChain) {
@@ -44,5 +49,11 @@ Button {
             event.accepted = true;
             break;
         }
+    }
+
+    // The P5M focus marker, same as everywhere else.
+    FocusFrame {
+        radius: 10
+        shown: parent.visualFocus
     }
 }

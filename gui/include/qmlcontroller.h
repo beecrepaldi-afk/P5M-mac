@@ -2,6 +2,8 @@
 
 #include "controllermanager.h"
 
+#include <QEvent>
+
 class QTimer;
 
 class QmlController : public QObject
@@ -28,6 +30,7 @@ public:
 
 private:
     void sendKey(Qt::Key key, Qt::KeyboardModifiers modifiers = Qt::NoModifier);
+    void sendKeyEvent(QEvent::Type type, Qt::Key key);
 
     QObject *target = {};
     uint32_t escape_shortcut = 0;

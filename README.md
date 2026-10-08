@@ -1,3 +1,12 @@
+# P5M for macOS
+
+P5M is an Apple Silicon Remote Play app based on chiaki-ng. It adds a Metal renderer, controller navigation, HDR interface fixes and macOS Shortcuts integrations.
+
+See [release preview and hardware checks](mac/RELEASE.md), [build notes](mac/LEIAME.md), and [packaging/signing requirements](mac/DISTRIBUTION.md). The current local package requires macOS 27; its ad-hoc signature is for local testing. Developer ID, notarization, exact source publication and hardware validation remain release prerequisites.
+
+The upstream project and attribution follow below.
+
+---
 
 ![chiaki-ng Logo](gui/res/chiaking-logo.svg)
 

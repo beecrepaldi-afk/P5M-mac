@@ -12,6 +12,8 @@
     <file>RegistDialog.qml</file>
     <file>SteamShortcutDialog.qml</file>
     <file>SettingsDialog.qml</file>
+    <file>BasicSettingsDialog.qml</file>
+    <file>SystemDiagnosticsDialog.qml</file>
     <file>DisplaySettingsDialog.qml</file>
     <file>PlaceboSettingsDialog.qml</file>
     <file>PlaceboColorMappingDialog.qml</file>
@@ -22,6 +24,23 @@
     <file>ControllerMappingDialog.qml</file>
     <file>AutoConnectView.qml</file>
     <file>PsnView.qml</file>
+    <file>p5m/qmldir</file>
+    <file>p5m/Theme.qml</file>
+    <file>p5m/Backdrop.qml</file>
+    <file>p5m/Glass.qml</file>
+    <file>p5m/FocusFrame.qml</file>
+    <file>p5m/Glyph.qml</file>
+    <file>p5m/Hint.qml</file>
+    <file>p5m/HintBar.qml</file>
+    <file>p5m/BrandHeader.qml</file>
+    <file>p5m/PrimaryButton.qml</file>
+    <file>p5m/SectionLabel.qml</file>
+    <file>p5m/HoldRing.qml</file>
+    <file>p5m/GlassButton.qml</file>
+    <file>p5m/StepRow.qml</file>
+    <file>p5m/Meter.qml</file>
+    <file>p5m/PadKeyboard.qml</file>
+    <file>p5m/ConnectingScreen.qml</file>
     <file>controls/Button.qml</file>
     <file>controls/CheckBox.qml</file>
     <file>controls/ComboBox.qml</file>

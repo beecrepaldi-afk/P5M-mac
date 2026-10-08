@@ -157,6 +157,11 @@ typedef struct chiaki_takion_t
 	bool video_queue_initialized;
 	int64_t video_queue_head_wait_start_us;
 	uint64_t video_queue_head_wait_seq_num;
+	// Contagem de unidades AV já entregues no quadro atual para avaliar o FEC.
+	bool p5m_fec_frame_valid;
+	ChiakiSeqNum16 p5m_fec_frame_index;
+	uint16_t p5m_fec_last_unit, p5m_fec_units_total, p5m_fec_units_fec;
+	uint32_t p5m_fec_received;
 	ChiakiTakionSendBuffer send_buffer;
 
 	ChiakiTakionCallback cb;
@@ -181,7 +186,34 @@ typedef struct chiaki_takion_t
 	ChiakiKeyState key_state;
 
 	bool enable_dualsense;
+
+	/**
+	 * Takion v20 extended header: 8 bytes right after the packet type byte in every packet,
+	 * holding the sender's send time (us, u32 BE) and a packet counter (u32 BE).
+	 * 0 until chiaki_takion_set_version() switches to v20, CHIAKI_TAKION_EXT_HEADER_SIZE after.
+	 * Written only from the stream connection before BIG; read by the takion thread.
+	 */
+	uint8_t ext_size;
+	uint32_t ext_counter; // protected by gkcrypt_local_mutex
+	uint64_t ext_clock_start_us;
+	// Receive side of the extended header (takion thread only).
+	bool ext_rx_have_prev;
+	uint64_t ext_rx_prev_local_us;
+	uint32_t ext_rx_prev_remote_us;
+	uint64_t ext_rx_window_start_us;
+	uint64_t ext_rx_count;
+	uint64_t ext_rx_abs_sum_us;
+	uint32_t ext_rx_abs_max_us;
 } ChiakiTakion;
+
+#define CHIAKI_TAKION_EXT_HEADER_SIZE 8
+
+/**
+ * Switch the protocol version after TAKIONPROTOCOLREQUESTACK.
+ * Supported: 12 (unchanged) and 20 (adds the extended header).
+ * Call from the stream connection before sending BIG, while the console is still waiting for it.
+ */
+CHIAKI_EXPORT ChiakiErrorCode chiaki_takion_set_version(ChiakiTakion *takion, uint8_t version);
 
 
 CHIAKI_EXPORT ChiakiErrorCode chiaki_takion_connect(ChiakiTakion *takion, ChiakiTakionConnectInfo *info, chiaki_socket_t *sock);
@@ -260,6 +292,12 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_takion_v9_av_packet_parse(ChiakiTakionAVPac
 #define CHIAKI_TAKION_V12_AV_HEADER_SIZE_AUDIO 0x13
 
 CHIAKI_EXPORT ChiakiErrorCode chiaki_takion_v12_av_packet_parse(ChiakiTakionAVPacket *packet, ChiakiKeyState *key_state, uint8_t *buf, size_t buf_size);
+
+/**
+ * v20: the v12 layout shifted by CHIAKI_TAKION_EXT_HEADER_SIZE, audio FEC count narrowed to 12 bits
+ * and the audio haptics marker moved to the low nibble of its byte.
+ */
+CHIAKI_EXPORT ChiakiErrorCode chiaki_takion_v20_av_packet_parse(ChiakiTakionAVPacket *packet, ChiakiKeyState *key_state, uint8_t *buf, size_t buf_size);
 
 #define CHIAKI_TAKION_V7_AV_HEADER_SIZE_BASE					0x12
 #define CHIAKI_TAKION_V7_AV_HEADER_SIZE_VIDEO_ADD				0x3

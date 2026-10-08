@@ -456,7 +456,9 @@ static const QMap<ChiakiVideoResolutionPreset, QString> resolutions = {
 
 static const ChiakiVideoResolutionPreset resolution_default_ps4 = CHIAKI_VIDEO_RESOLUTION_PRESET_720p;
 static const ChiakiVideoResolutionPreset resolution_default_ps5_local = CHIAKI_VIDEO_RESOLUTION_PRESET_1080p;
-static const ChiakiVideoResolutionPreset resolution_default_ps5_remote = CHIAKI_VIDEO_RESOLUTION_PRESET_720p;
+// Remote (PSN) at 1080p too: over a decent connection 25 Mbps carries it
+// without loss (measured 03/10/2026), and 720p looked soft upscaled.
+static const ChiakiVideoResolutionPreset resolution_default_ps5_remote = CHIAKI_VIDEO_RESOLUTION_PRESET_1080p;
 
 ChiakiVideoResolutionPreset Settings::GetResolutionLocalPS4() const
 {
@@ -647,7 +649,10 @@ void Settings::SetCodecRemotePS5(ChiakiCodec codec)
 
 unsigned int Settings::GetAudioBufferSizeDefault() const
 {
-	return 9600;
+	// P5M: 10 ms (was 50). The output keeps up to two buffers queued, so the
+	// sound came ~100-150 ms after the picture; now ~30 ms. At 20 ms the
+	// queue never ran dry over PSN from a hotel (04/10/2026).
+	return 1920;
 }
 
 unsigned int Settings::GetAudioBufferSizeRaw() const
@@ -702,11 +707,12 @@ void Settings::SetPlaceboPreset(PlaceboPreset preset)
 static const QMap<RenderBackend, QString> render_backend_values = {
 	{ RenderBackend::Vulkan, "vulkan" },
 	{ RenderBackend::OpenGL, "opengl" },
+	{ RenderBackend::Metal, "metal" },
 };
 
-#if defined(Q_OS_MACOS) && QT_VERSION >= QT_VERSION_CHECK(6, 10, 0)
-// Default to OpenGL on macOS with Qt >= 6.10 due to MoltenVK bug
-static const RenderBackend render_backend_default = RenderBackend::OpenGL;
+#if defined(Q_OS_MACOS)
+// Default to Metal on macOS (Vulkan/MoltenVK is broken with Qt >= 6.10)
+static const RenderBackend render_backend_default = RenderBackend::Metal;
 #else
 static const RenderBackend render_backend_default = RenderBackend::Vulkan;
 #endif
@@ -722,6 +728,12 @@ RenderBackend Settings::GetRenderBackend() const
 		qWarning() << "Forcing OpenGL backend on macOS (Vulkan unavailable because of Qt 6.10 MoltenVK bug)";
 		return RenderBackend::OpenGL;
 	}
+#endif
+
+#if !defined(Q_OS_MACOS)
+	// Metal only exists on macOS
+	if (backend == RenderBackend::Metal)
+		return render_backend_default;
 #endif
 
 	return backend;
@@ -826,6 +838,27 @@ QString Settings::GetHardwareDecoder() const
 void Settings::SetHardwareDecoder(const QString &hw_decoder)
 {
 	settings.setValue("settings/hw_decoder", hw_decoder);
+}
+
+// Só fontes multicanal passam pelo mixer espacial; estéreo segue direto.
+bool Settings::GetMacSpatialAudio() const
+{
+	return settings.value("settings/mac_spatial_audio", true).toBool();
+}
+
+void Settings::SetMacSpatialAudio(bool enabled)
+{
+	settings.setValue("settings/mac_spatial_audio", enabled);
+}
+
+bool Settings::GetMacHeadTracking() const
+{
+	return settings.value("settings/mac_head_tracking", false).toBool();
+}
+
+void Settings::SetMacHeadTracking(bool enabled)
+{
+	settings.setValue("settings/mac_head_tracking", enabled);
 }
 
 int Settings::GetAudioVolume() const
@@ -1004,7 +1037,12 @@ void Settings::SetKeyboardEnabled(bool enabled)
 
 bool Settings::GetMouseTouchEnabled() const
 {
+#ifdef Q_OS_MACOS
+	// On a Mac the trackpad is the pointer; the DualSense has its own touchpad.
+	return settings.value("settings/mouse_touch_enabled", false).toBool();
+#else
 	return settings.value("settings/mouse_touch_enabled", true).toBool();
+#endif
 }
 void Settings::SetMouseTouchEnabled(bool enabled)
 {
@@ -1070,29 +1108,30 @@ void Settings::SetStreamMenuEnabled(bool enabled)
 	settings.setValue("settings/stream_menu_enabled", enabled);
 }
 
+// Default stream menu chord: R1 + L3 + R3, the same as P5M on the Quest.
 uint Settings::GetStreamMenuShortcut1() const {
-	return settings.value("settings/stream_menu_shortcut1", 9).toUInt();
+	return settings.value("settings/stream_menu_shortcut1", 10).toUInt();
 }
 void Settings::SetStreamMenuShortcut1(uint button) {
 	settings.setValue("settings/stream_menu_shortcut1", button);
 }
 
 uint Settings::GetStreamMenuShortcut2() const {
-	return settings.value("settings/stream_menu_shortcut2", 10).toUInt();
+	return settings.value("settings/stream_menu_shortcut2", 11).toUInt();
 }
 void Settings::SetStreamMenuShortcut2(uint button) {
 	settings.setValue("settings/stream_menu_shortcut2", button);
 }
 
 uint Settings::GetStreamMenuShortcut3() const {
-	return settings.value("settings/stream_menu_shortcut3", 11).toUInt();
+	return settings.value("settings/stream_menu_shortcut3", 12).toUInt();
 }
 void Settings::SetStreamMenuShortcut3(uint button) {
 	settings.setValue("settings/stream_menu_shortcut3", button);
 }
 
 uint Settings::GetStreamMenuShortcut4() const {
-	return settings.value("settings/stream_menu_shortcut4", 12).toUInt();
+	return settings.value("settings/stream_menu_shortcut4", 0).toUInt();
 }
 void Settings::SetStreamMenuShortcut4(uint button) {
 	settings.setValue("settings/stream_menu_shortcut4", button);
@@ -1134,6 +1173,10 @@ ChiakiConnectVideoProfile Settings::GetVideoProfileLocalPS5()
 {
 	ChiakiConnectVideoProfile profile = {};
 	chiaki_connect_video_profile_preset(&profile, GetResolutionLocalPS5(), GetFPSLocalPS5());
+	// P5M: at home 1080p gets 30 Mbps by default instead of 15: a much cleaner
+	// picture, and the home network carries it with no extra delay.
+	if(GetResolutionLocalPS5() == CHIAKI_VIDEO_RESOLUTION_PRESET_1080p)
+		profile.bitrate = 30000;
 	unsigned int bitrate = GetBitrateLocalPS5();
 	if(bitrate)
 		profile.bitrate = bitrate;

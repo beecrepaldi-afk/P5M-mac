@@ -4,6 +4,69 @@
 #include "../include/chiaki/session.h"
 
 #include <string.h>
+#include <chiaki/time.h>
+
+// P5M diary: how long a frame takes to arrive (first unit -> flushed to the
+// decoder), how regularly frames start arriving, and how often FEC had to
+// fill in. One line every 10 s.
+static struct {
+	uint64_t window_start_us, frame_first_us, prev_first_us;
+	uint64_t span_sum_us, span_max_us, gap_max_us;
+	unsigned frames, units_sum, fec_used, failed, cur_units;
+	unsigned slices_sum, slices_max, slices_frames;
+} p5m_frames;
+
+// Slice NAL units in one access unit (Annex B): several slices per frame
+// would let decoding start before the whole frame is in.
+static unsigned p5m_count_slices(const uint8_t *buf, size_t size, bool hevc)
+{
+	unsigned n = 0;
+	for(size_t i = 0; i + 3 < size; i++)
+	{
+		if(buf[i] == 0 && buf[i + 1] == 0 && buf[i + 2] == 1)
+		{
+			const uint8_t h = buf[i + 3];
+			if(hevc ? (((h >> 1) & 0x3f) <= 21) : ((h & 0x1f) >= 1 && (h & 0x1f) <= 5))
+				n++;
+			i += 2;
+		}
+	}
+	return n;
+}
+
+static void p5m_frames_note_flush(ChiakiLog *log, ChiakiFrameProcessorFlushResult result)
+{
+	const uint64_t now = chiaki_time_now_monotonic_us();
+	if(p5m_frames.frame_first_us)
+	{
+		const uint64_t span = now - p5m_frames.frame_first_us;
+		p5m_frames.span_sum_us += span;
+		if(span > p5m_frames.span_max_us)
+			p5m_frames.span_max_us = span;
+		p5m_frames.units_sum += p5m_frames.cur_units;
+		p5m_frames.frames++;
+		p5m_frames.frame_first_us = 0;
+	}
+	if(result == CHIAKI_FRAME_PROCESSOR_FLUSH_RESULT_FEC_SUCCESS)
+		p5m_frames.fec_used++;
+	else if(result != CHIAKI_FRAME_PROCESSOR_FLUSH_RESULT_SUCCESS)
+		p5m_frames.failed++;
+	if(!p5m_frames.window_start_us)
+		p5m_frames.window_start_us = now;
+	if(now - p5m_frames.window_start_us >= 10000000 && p5m_frames.frames)
+	{
+		CHIAKI_LOGI(log, "[frames] 10s: %u frames, first->last unit avg %.2f max %.1f ms, %.1f units/frame, "
+				"start gap max %.1f ms, FEC used %u, failed %u, slices per frame avg %.2f max %u",
+				p5m_frames.frames, p5m_frames.span_sum_us / 1000.0 / p5m_frames.frames, p5m_frames.span_max_us / 1000.0,
+				(double)p5m_frames.units_sum / p5m_frames.frames, p5m_frames.gap_max_us / 1000.0,
+				p5m_frames.fec_used, p5m_frames.failed,
+				p5m_frames.slices_frames ? (double)p5m_frames.slices_sum / p5m_frames.slices_frames : 0.0, p5m_frames.slices_max);
+		p5m_frames.window_start_us = now;
+		p5m_frames.span_sum_us = p5m_frames.span_max_us = p5m_frames.gap_max_us = 0;
+		p5m_frames.frames = p5m_frames.units_sum = p5m_frames.fec_used = p5m_frames.failed = 0;
+		p5m_frames.slices_sum = p5m_frames.slices_max = p5m_frames.slices_frames = 0;
+	}
+}
 
 static ChiakiErrorCode chiaki_video_receiver_flush_frame(ChiakiVideoReceiver *video_receiver);
 
@@ -168,12 +231,21 @@ CHIAKI_EXPORT void chiaki_video_receiver_av_packet(ChiakiVideoReceiver *video_re
 		}
 
 		video_receiver->frame_index_cur = frame_index;
+		{
+			const uint64_t now = chiaki_time_now_monotonic_us();
+			if(p5m_frames.prev_first_us && now - p5m_frames.prev_first_us > p5m_frames.gap_max_us)
+				p5m_frames.gap_max_us = now - p5m_frames.prev_first_us;
+			p5m_frames.prev_first_us = now;
+			p5m_frames.frame_first_us = now;
+			p5m_frames.cur_units = 0;
+		}
 		err = chiaki_frame_processor_alloc_frame(&video_receiver->frame_processor, packet);
 		if(err != CHIAKI_ERR_SUCCESS)
 			CHIAKI_LOGW(video_receiver->log, "Video receiver could not allocate frame for packet.");
 	}
 
 	err = chiaki_frame_processor_put_unit(&video_receiver->frame_processor, packet);
+	p5m_frames.cur_units++;
 	if(err != CHIAKI_ERR_SUCCESS)
 		CHIAKI_LOGW(video_receiver->log, "Video receiver could not put unit.");
 
@@ -193,6 +265,16 @@ static ChiakiErrorCode chiaki_video_receiver_flush_frame(ChiakiVideoReceiver *vi
 	uint8_t *frame;
 	size_t frame_size;
 	ChiakiFrameProcessorFlushResult flush_result = chiaki_frame_processor_flush(&video_receiver->frame_processor, &frame, &frame_size);
+	if(flush_result == CHIAKI_FRAME_PROCESSOR_FLUSH_RESULT_SUCCESS || flush_result == CHIAKI_FRAME_PROCESSOR_FLUSH_RESULT_FEC_SUCCESS)
+	{
+		const ChiakiCodec codec = video_receiver->session->connect_info.video_profile.codec;
+		const unsigned slices = p5m_count_slices(frame, frame_size, codec == CHIAKI_CODEC_H265 || codec == CHIAKI_CODEC_H265_HDR);
+		p5m_frames.slices_sum += slices;
+		p5m_frames.slices_frames++;
+		if(slices > p5m_frames.slices_max)
+			p5m_frames.slices_max = slices;
+	}
+	p5m_frames_note_flush(video_receiver->log, flush_result);
 
 	if(flush_result == CHIAKI_FRAME_PROCESSOR_FLUSH_RESULT_FAILED
 		|| flush_result == CHIAKI_FRAME_PROCESSOR_FLUSH_RESULT_FEC_FAILED)

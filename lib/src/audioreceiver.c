@@ -103,7 +103,18 @@ CHIAKI_EXPORT void chiaki_audio_receiver_av_packet(ChiakiAudioReceiver *audio_re
 
 	if((uint16_t)fec_units_count + (uint16_t)source_units_count != packet->units_in_frame_total)
 	{
-		CHIAKI_LOGE(audio_receiver->log, "Source Units + FEC Units != Total Units in Audio AV Packet");
+		// P5M: Takion v20 packs these fields differently; dump a few to work out the layout.
+		static int p5m_dumped = 0;
+		if(p5m_dumped < 12)
+		{
+			p5m_dumped++;
+			CHIAKI_LOGE(audio_receiver->log, "[takion-v20] audio units: index %u total %u fec field %#x frame %u data %zu bytes",
+				(unsigned)packet->unit_index, (unsigned)packet->units_in_frame_total, (unsigned)packet->units_in_frame_fec,
+				(unsigned)packet->frame_index, packet->data_size);
+			chiaki_log_hexdump(audio_receiver->log, CHIAKI_LOG_ERROR, packet->data, packet->data_size < 48 ? packet->data_size : 48);
+		}
+		else
+			CHIAKI_LOGE(audio_receiver->log, "Source Units + FEC Units != Total Units in Audio AV Packet");
 		return;
 	}
 

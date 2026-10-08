@@ -5,6 +5,8 @@ import QtQuick.Controls.Material
 
 import org.streetpea.chiaking
 
+import "p5m"
+
 Item {
     id: root
     property list<Item> restoreFocusItems
@@ -12,7 +14,10 @@ Item {
     readonly property bool preferSeparateStreamSettingsWindows: Chiaki.window.runtimeRendererBackend === 1 && Chiaki.session
     property bool useSeparateStreamSettingsWindows: false
     Material.theme: Material.Dark
-    Material.accent: "#00a7ff"
+    Material.accent: Theme.focus
+    Material.primary: Theme.accent
+    Material.background: "#0E1A32"
+    Material.foreground: Theme.text
 
     function controllerButton(name) {
         let type = "deck";
@@ -186,8 +191,23 @@ Item {
         stack.push(registDialogComponent, {host: host, ps5: ps5});
     }
 
-    function showSettingsDialog() {
-        stack.push(settingsDialogComponent);
+    // page: "screen", "stream", "controller", "general". The basic settings
+    // (controller friendly); every option is behind "Advanced options".
+    function showSettingsDialog(page) {
+        stack.push(basicSettingsDialogComponent, page ? {initialPage: page} : {});
+    }
+
+    // The full dialog; page also takes "consoles" and "remote".
+    property bool systemDiagnosticsOpen: false
+    function showSystemDiagnostics() {
+        if (systemDiagnosticsOpen)
+            return;
+        systemDiagnosticsOpen = true;
+        stack.push(systemDiagnosticsComponent);
+    }
+
+    function showAdvancedSettingsDialog(page) {
+        stack.push(settingsDialogComponent, page ? {initialPage: page} : {});
     }
 
     function showDisplaySettingsDialog() {
@@ -249,7 +269,7 @@ Item {
             stack.replace(stack.get(0), autoConnectViewComponent, {}, StackView.Immediate);
     }
 
-    Pane {
+    Backdrop {
         anchors.fill: parent
         visible: !Chiaki.window.hasVideo && !Chiaki.window.keepVideo
     }
@@ -257,6 +277,8 @@ Item {
     StackView {
         id: stack
         anchors.fill: parent
+        // Keep the screens out of the strip macOS hides around the camera.
+        anchors.topMargin: Chiaki.window.hiddenTop
         hoverEnabled: false
         initialItem: mainViewComponent
         font.pixelSize: 20
@@ -515,12 +537,23 @@ Item {
         id: confirmDialog
     }
 
+    // Typing with the controller (address, PIN, PSN...).
+    PadKeyboard {
+        id: padKeyboard
+    }
+
+    function openKeyboard(field) {
+        padKeyboard.openFor(field);
+    }
+
     RemindDialog {
         id: remindDialog
     }
 
     Connections {
         target: Chiaki
+
+        function onSystemDiagnosticsRequested() { root.showSystemDiagnostics(); }
 
         function onSessionChanged() {
             if (Chiaki.session)
@@ -590,6 +623,16 @@ Item {
     Component {
         id: settingsDialogComponent
         SettingsDialog { }
+    }
+
+    Component {
+        id: systemDiagnosticsComponent
+        SystemDiagnosticsDialog { }
+    }
+
+    Component {
+        id: basicSettingsDialogComponent
+        BasicSettingsDialog { }
     }
 
     Component {

@@ -1,4 +1,11 @@
 #include "qmlbackend.h"
+#include "macSystemConsoleIdentity.h"
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QCryptographicHash>
+#include <QUuid>
+#include <QPointer>
+#include <cmath>
 #include "qmlsettings.h"
 #include "qmlmainwindow.h"
 #include "streamsession.h"
@@ -9,6 +16,8 @@
 #include "chiaki/remote/holepunch.h"
 #ifdef Q_OS_MACOS
 #include "macWakeSleep.h"
+#include "macStreamActivity.h"
+#include "macSystemIntegration.h"
 #elif defined(Q_OS_WINDOWS)
 #include "windowsWakeSleep.h"
 #endif
@@ -195,7 +204,7 @@ static inline bool frame_has_planes(const AVFrame *frame)
     return frame->data[0] && planes > 0;
 }
 
-static bool frame_can_use_direct_render(const AVFrame *frame, bool use_opengl_renderer)
+static bool frame_can_use_direct_render(const AVFrame *frame, bool use_opengl_renderer, bool use_metal_renderer)
 {
     if (!frame || !frame->hw_frames_ctx)
         return true;
@@ -203,6 +212,11 @@ static bool frame_can_use_direct_render(const AVFrame *frame, bool use_opengl_re
     switch (frame->format) {
     case AV_PIX_FMT_VULKAN:
         return true;
+#ifdef Q_OS_MACOS
+    case AV_PIX_FMT_VIDEOTOOLBOX:
+        // The Metal renderer samples the CVPixelBuffer in place.
+        return use_metal_renderer;
+#endif
 #ifdef Q_OS_LINUX
     case AV_PIX_FMT_VAAPI:
         return !use_opengl_renderer;
@@ -317,6 +331,11 @@ QmlBackend::QmlBackend(Settings *settings, QmlMainWindow *window)
             &QmlMainWindow::updateVSync,
             Qt::QueuedConnection);
     connect(settings_qml,
+            &QmlSettings::hdrOutputChanged,
+            window,
+            &QmlMainWindow::updateVSync,
+            Qt::QueuedConnection);
+    connect(settings_qml,
             &QmlSettings::vulkanDeferredSwapChanged,
             window,
             &QmlMainWindow::updateVulkanDeferredSwap,
@@ -421,15 +440,35 @@ QmlBackend::QmlBackend(Settings *settings, QmlMainWindow *window)
     mac_wake_sleep = new MacWakeSleep(this);
     connect(mac_wake_sleep, &MacWakeSleep::wokeUp, this, &QmlBackend::resumeFromSleep);
     connect(ControllerManager::GetInstance(), &ControllerManager::ControllerMoved, mac_wake_sleep, &MacWakeSleep::simulateUserActivity);
+    connect(this, &QmlBackend::sessionChanged, this, [](StreamSession *s) { setMacStreamActivity(s != nullptr); });
 #elif defined(Q_OS_WINDOWS)
     windows_wake_sleep = new WindowsWakeSleep(this);
     connect(windows_wake_sleep, &WindowsWakeSleep::wokeUp, this, &QmlBackend::resumeFromSleep);
     connect(windows_wake_sleep, &WindowsWakeSleep::sleeping, this, &QmlBackend::goToSleep);
 #endif
     refreshPsnToken();
+
+#ifdef Q_OS_MACOS
+    p5m_mac_system_register_actions([](const char *action, const char *console_id, void *context) -> int {
+        auto *self = static_cast<QmlBackend *>(context);
+        return self->runSystemAction(QString::fromUtf8(action), QString::fromUtf8(console_id ? console_id : ""));
+    }, this);
+    connect(this, &QmlBackend::hostsChanged, this, &QmlBackend::refreshSystemConsoles);
+    refreshSystemConsoles();
+    refreshSystemModelStatus();
+#endif
+    connect(this, &QmlBackend::sessionChanged, this, [this](StreamSession *current) {
+        if (current) {
+            system_session_clock.start();
+            system_session_metrics = {};
+            system_session_explanation.clear();
+            system_session_summary = tr("The diagnostic summary will be available when this session ends.");
+            emit systemIntegrationChanged();
+        }
+    });
 }
 
-bool QmlBackend::prepareFrameForPresentation(ChiakiFfmpegFrame &frame, bool use_opengl_renderer)
+bool QmlBackend::prepareFrameForPresentation(ChiakiFfmpegFrame &frame, bool use_opengl_renderer, bool use_metal_renderer)
 {
     if (!frame.frame)
         return false;
@@ -440,7 +479,7 @@ bool QmlBackend::prepareFrameForPresentation(ChiakiFfmpegFrame &frame, bool use_
     if (!frame.frame->hw_frames_ctx)
         return frame_has_planes(frame.frame);
 
-    const bool direct_render = !disable_zero_copy && frame_can_use_direct_render(frame.frame, use_opengl_renderer);
+    const bool direct_render = !disable_zero_copy && frame_can_use_direct_render(frame.frame, use_opengl_renderer, use_metal_renderer);
     if (direct_render)
         return frame_has_planes(frame.frame);
 
@@ -485,6 +524,10 @@ bool QmlBackend::prepareFrameForPresentation(ChiakiFfmpegFrame &frame, bool use_
 
 QmlBackend::~QmlBackend()
 {
+#ifdef Q_OS_MACOS
+    p5m_mac_system_register_actions(nullptr, nullptr);
+    p5m_mac_system_clear_context();
+#endif
     if(session)
     {
         chiaki_log_mutex.lock();
@@ -970,7 +1013,9 @@ void QmlBackend::createSession(const StreamSessionConnectInfo &connect_info)
                           << "is not currently available, falling back to auto";
         session_info.hw_decoder = "auto";
     }
-    bool use_opengl_renderer = window && window->runtimeRendererBackend() == static_cast<int>(RenderBackend::OpenGL);
+    // Metal, like OpenGL, cannot take Vulkan frames, so it shares the decoder fallbacks.
+    const bool use_metal_renderer = window && window->runtimeRendererBackend() == static_cast<int>(RenderBackend::Metal);
+    bool use_opengl_renderer = use_metal_renderer || (window && window->runtimeRendererBackend() == static_cast<int>(RenderBackend::OpenGL));
     bool prefer_cuda = window && window->nvidiaCard() && availableDecoders.contains("cuda");
     auto fallbackVulkanDecoderForOpenGL = [&]() {
         if (!use_opengl_renderer || session_info.hw_decoder != "vulkan")
@@ -1104,7 +1149,7 @@ void QmlBackend::createSession(const StreamSessionConnectInfo &connect_info)
         return;
     }
 
-    connect(session, &StreamSession::FfmpegFrameAvailable, frame_thread->parent(), [this, use_opengl_renderer]() {
+    connect(session, &StreamSession::FfmpegFrameAvailable, frame_thread->parent(), [this, use_opengl_renderer, use_metal_renderer]() {
         ChiakiFfmpegDecoder *decoder = session->GetFfmpegDecoder();
         if (!decoder) {
             qCCritical(chiakiGui) << "Session has no FFmpeg decoder";
@@ -1120,7 +1165,7 @@ void QmlBackend::createSession(const StreamSessionConnectInfo &connect_info)
             pending_recovered_frame.storeRelaxed(1);
 
         const qint64 prepare_begin_us = static_cast<qint64>(chiaki_time_now_monotonic_us());
-        if (!prepareFrameForPresentation(frame, use_opengl_renderer))
+        if (!prepareFrameForPresentation(frame, use_opengl_renderer, use_metal_renderer))
         {
             av_frame_free(&frame.frame);
             return;
@@ -1148,6 +1193,7 @@ void QmlBackend::createSession(const StreamSessionConnectInfo &connect_info)
         if (session != session_for_connections)
             return;
 
+        captureSystemSessionMetrics(session_for_connections);
         if (chiaki_quit_reason_is_error(reason)) {
             QString m = tr("Chiaki Session has quit") + ":\n" + chiaki_quit_reason_string(reason);
             if (!reason_str.isEmpty())
@@ -1235,6 +1281,13 @@ void QmlBackend::createSession(const StreamSessionConnectInfo &connect_info)
             setConnectState(PsnConnectState::InitiatingConnection);
             emit psnConnect(session, session_info.duid, chiaki_target_is_ps5(session_info.target));
     }
+}
+
+QString QmlBackend::connectingConsole() const
+{
+    if (!session_info.nickname.isEmpty())
+        return session_info.nickname;
+    return wakeup_nickname;
 }
 
 bool QmlBackend::closeRequested()
@@ -1516,6 +1569,10 @@ void QmlBackend::setWebEngineHints(QQuickWebEngineProfile *profile)
 
 void QmlBackend::connectToHost(int index, QString nickname)
 {
+    if (system_explanation_busy) {
+        emit error(tr("Local explanation in progress"), tr("Wait for the local explanation to finish before starting another session."));
+        return;
+    }
     window->setWindowAdjustable(false);
     auto server = displayServerAt(index);
     if (!server.valid)
@@ -2379,7 +2436,7 @@ void QmlBackend::applyStartupWindowSizing()
         return;
 
     const auto &connect_info = session_info;
-    if (window->windowState() == Qt::WindowFullScreen)
+    if (window->isFullscreen())
         return;
 
     if(settings->GetWindowType() == WindowType::CustomResolution)
@@ -2659,4 +2716,211 @@ void PsnConnectionWorker::ConnectPsnConnection(StreamSession *session, const QSt
 {
     ChiakiErrorCode result = session->ConnectPsnConnection(duid, ps5);
     emit resultReady(result);
+}
+
+
+void QmlBackend::captureSystemSessionMetrics(StreamSession *source)
+{
+    if (!source || !system_session_clock.isValid())
+        return;
+    const double seconds = system_session_clock.elapsed() / 1000.0;
+    const double bitrate = source->GetMeasuredBitrate();
+    const double loss = source->GetAveragePacketLoss() * 100.0;
+    system_session_metrics = {{"duration_seconds", seconds}, {"frames_lost", source->GetFramesLost()}};
+    if (std::isfinite(bitrate) && bitrate >= 0)
+        system_session_metrics.insert("bitrate_mbps", bitrate);
+    if (std::isfinite(loss) && loss >= 0 && loss <= 100)
+        system_session_metrics.insert("packet_loss_percent", loss);
+    system_session_summary = tr("Duration: %1 min\nLost frames: %2\nFinal bitrate sample: %3 Mbps\nFinal packet loss sample: %4%")
+        .arg(seconds / 60.0, 0, 'f', 1).arg(source->GetFramesLost())
+        .arg(bitrate, 0, 'f', 1).arg(loss, 0, 'f', 2);
+    system_session_explanation.clear();
+    emit systemIntegrationChanged();
+    if (system_diagnostic_visible)
+        setSystemDiagnosticContext(true);
+}
+
+void QmlBackend::refreshSystemConsoles()
+{
+#ifdef Q_OS_MACOS
+    QJsonArray list;
+    system_console_keys.clear();
+    QSettings store;
+    QSet<QString> seen;
+    int ordinal = 0;
+    for (const auto &value : hosts()) {
+        const auto host = value.toMap();
+        if (!host.value("registered").toBool() || !host.value("display", true).toBool())
+            continue;
+        QString key = host.value("mac").toString();
+        if (key.isEmpty()) {
+            for (const auto &registered : settings->GetRegisteredHosts())
+                if (registered.GetServerNickname() == host.value("name").toString()) {
+                    key = registered.GetServerMAC().ToString();
+                    break;
+                }
+        }
+        if (key.isEmpty())
+            key = host.value("duid").toString();
+        if (key.isEmpty())
+            continue;
+        key = QString::fromLatin1(QCryptographicHash::hash(key.toUtf8(), QCryptographicHash::Sha256).toHex());
+        const QString setting = "mac/shortcut_ids/" + key;
+        QString opaque = store.value(setting).toString();
+        if (opaque.isEmpty()) {
+            opaque = QUuid::createUuid().toString(QUuid::WithoutBraces);
+            store.setValue(setting, opaque);
+        }
+        if (seen.contains(opaque))
+            continue;
+        seen.insert(opaque);
+        system_console_keys.insert(key, opaque);
+        // Nome genérico: nenhum apelido pessoal ou endereço entra no índice do sistema.
+        const QString name = (host.value("ps5").toBool() ? "PS5 " : "PS4 ") + QString::number(++ordinal);
+        list.append(QJsonObject{{"id", opaque}, {"name", name}});
+    }
+    p5m_mac_system_set_consoles(QJsonDocument(list).toJson(QJsonDocument::Compact).constData());
+    p5m_mac_system_refresh_shortcuts();
+#endif
+}
+
+int QmlBackend::runSystemAction(const QString &action, const QString &console_id)
+{
+    if (action == "diagnostics") {
+        showSystemDiagnostics();
+        return 0;
+    }
+    if (action == "mute") {
+        if (!session)
+            return 1;
+        session->SetMuted(true);
+        return 0;
+    }
+    if ((action != "wake" && action != "connect") || session || system_explanation_busy)
+        return 1;
+    refreshSystemConsoles();
+    for (const auto &value : hosts()) {
+        const auto host = value.toMap();
+        if (!host.value("display", true).toBool())
+            continue;
+        QString key = host.value("mac").toString();
+        if (key.isEmpty()) {
+            for (const auto &registered : settings->GetRegisteredHosts())
+                if (registered.GetServerNickname() == host.value("name").toString()) {
+                    key = registered.GetServerMAC().ToString();
+                    break;
+                }
+        }
+        if (key.isEmpty())
+            key = host.value("duid").toString();
+        const QString hash = QString::fromLatin1(QCryptographicHash::hash(key.toUtf8(), QCryptographicHash::Sha256).toHex());
+        if (!console_id.isEmpty() && system_console_keys.value(hash) == console_id) {
+            MacSystemConsoleIdentity selected;
+            selected.kind = host.value("discovered").toBool() ? MacSystemConsoleIdentity::Kind::Discovered
+                : (host.value("manual").toBool() ? MacSystemConsoleIdentity::Kind::Manual : MacSystemConsoleIdentity::Kind::PSN);
+            selected.registered = host.value("registered").toBool();
+            selected.ps5 = host.value("ps5").toBool();
+            selected.mac = host.value("mac").toString().toStdString();
+            selected.address = host.value("address").toString().toStdString();
+            selected.duid = host.value("duid").toString().toStdString();
+            if (action == "wake" && (selected.kind == MacSystemConsoleIdentity::Kind::PSN || selected.address.empty()))
+                return 1;
+
+            // displayServerAt inclui entradas que hosts() oculta. O ID do
+            // atalho identifica o console, mas não fornece um ordinal seguro.
+            const int count = discovery_manager.GetHosts().size() + settings->GetManualHosts().size() + psn_hosts.size();
+            for (int index = 0; index < count; ++index) {
+                const auto server = displayServerAt(index);
+                if (!server.valid || !server.registered)
+                    continue;
+                MacSystemConsoleIdentity candidate;
+                candidate.registered = true;
+                if (server.discovered) {
+                    candidate.kind = MacSystemConsoleIdentity::Kind::Discovered;
+                    candidate.mac = server.discovery_host.GetHostMAC().ToString().toStdString();
+                    candidate.address = server.discovery_host.host_addr.toStdString();
+                    candidate.ps5 = server.discovery_host.ps5;
+                } else if (server.manual_host.GetID() >= 0) {
+                    candidate.kind = MacSystemConsoleIdentity::Kind::Manual;
+                    candidate.mac = server.registered_host.GetServerMAC().ToString().toStdString();
+                    candidate.address = server.manual_host.GetHost().toStdString();
+                    candidate.ps5 = server.IsPS5();
+                } else {
+                    candidate.kind = MacSystemConsoleIdentity::Kind::PSN;
+                    candidate.duid = server.duid.toStdString();
+                    candidate.ps5 = server.psn_host.IsPS5();
+                }
+                if (!MacSystemConsoleMatches(selected, candidate))
+                    continue;
+                if (action == "wake")
+                    wakeUpHost(index, host.value("name").toString());
+                else
+                    connectToHost(index, host.value("name").toString());
+                return 0;
+            }
+            return 1;
+        }
+    }
+    return 1;
+}
+
+void QmlBackend::refreshSystemModelStatus()
+{
+#ifdef Q_OS_MACOS
+    auto *weak = new QPointer<QmlBackend>(this);
+    p5m_mac_system_model_status([](int, const char *text, void *context) {
+        std::unique_ptr<QPointer<QmlBackend>> owner(static_cast<QPointer<QmlBackend> *>(context));
+        if (owner->isNull())
+            return;
+        owner->data()->system_model_status = QString::fromUtf8(text);
+        emit owner->data()->systemIntegrationChanged();
+    }, weak);
+#else
+    system_model_status = tr("Local Apple Intelligence is available on supported Macs only.");
+    emit systemIntegrationChanged();
+#endif
+}
+
+void QmlBackend::explainLastSession()
+{
+    if (session || system_explanation_busy || system_session_metrics.isEmpty())
+        return;
+#ifdef Q_OS_MACOS
+    system_explanation_busy = true;
+    system_session_explanation = tr("Preparing a local explanation...");
+    emit systemIntegrationChanged();
+    auto *weak = new QPointer<QmlBackend>(this);
+    const QByteArray metrics = QJsonDocument(system_session_metrics).toJson(QJsonDocument::Compact);
+    p5m_mac_system_explain_session(metrics.constData(), [](int status, const char *text, void *context) {
+        std::unique_ptr<QPointer<QmlBackend>> owner(static_cast<QPointer<QmlBackend> *>(context));
+        if (owner->isNull())
+            return;
+        auto *self = owner->data();
+        self->system_explanation_busy = false;
+        self->system_session_explanation = status == 0 ? QString::fromUtf8(text)
+            : self->tr("Local explanation unavailable: %1\nThe measured summary above is still available.").arg(QString::fromUtf8(text));
+        emit self->systemIntegrationChanged();
+    }, weak);
+#endif
+}
+
+void QmlBackend::setSystemDiagnosticContext(bool visible)
+{
+    system_diagnostic_visible = visible;
+#ifdef Q_OS_MACOS
+    if (visible) {
+        const QByteArray summary = QJsonDocument(system_session_metrics).toJson(QJsonDocument::Compact);
+        p5m_mac_system_set_context("diagnostics", "last-session", "P5M session diagnostics", summary.constData());
+    } else {
+        p5m_mac_system_clear_context();
+    }
+#endif
+}
+
+void QmlBackend::showSystemDiagnostics()
+{
+    window->show();
+    window->raise();
+    window->requestActivate();
+    emit systemDiagnosticsRequested();
 }

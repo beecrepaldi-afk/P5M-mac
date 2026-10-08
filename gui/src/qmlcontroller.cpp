@@ -7,6 +7,10 @@
 #include <QStyleHints>
 #include <QGuiApplication>
 
+#ifdef Q_OS_MACOS
+#include "macControllerGestures.h"
+#endif
+
 static QVector<QPair<uint32_t, Qt::Key>> key_map = {
     { CHIAKI_CONTROLLER_BUTTON_DPAD_UP, Qt::Key_Up },
     { CHIAKI_CONTROLLER_BUTTON_DPAD_DOWN, Qt::Key_Down },
@@ -52,19 +56,43 @@ QmlController::QmlController(Controller *c, uint32_t shortcut, QObject *t, QObje
         else if (state.left_y < -30000)
             buttons |= CHIAKI_CONTROLLER_BUTTON_DPAD_UP;
 
+        // Only the D-pad (and the stick) repeats while held. Repeating Cross
+        // or Circle fired an action again every 80 ms.
+        const uint32_t repeating = CHIAKI_CONTROLLER_BUTTON_DPAD_UP | CHIAKI_CONTROLLER_BUTTON_DPAD_DOWN
+            | CHIAKI_CONTROLLER_BUTTON_DPAD_LEFT | CHIAKI_CONTROLLER_BUTTON_DPAD_RIGHT;
         for (auto &k : std::as_const(key_map)) {
             const bool pressed = buttons & k.first;
             const bool old_pressed = old_buttons & k.first;
+            if (k.first == CHIAKI_CONTROLLER_BUTTON_MOON) {
+                // Circle reports press and release apart, so a screen can
+                // tell a tap (back) from a hold (end the session).
+                if (pressed && !old_pressed)
+                    sendKeyEvent(QEvent::KeyPress, k.second);
+                else if (old_pressed && !pressed)
+                    sendKeyEvent(QEvent::KeyRelease, k.second);
+                continue;
+            }
             if (pressed && !old_pressed) {
                 pressed_key = k.second;
                 sendKey(pressed_key);
                 repeat_running = 0;
-                repeat_timer->start(250);
+                if (k.first & repeating)
+                    repeat_timer->start(250);
+                else
+                    repeat_timer->stop();
             } else if (old_pressed && !pressed && pressed_key == k.second) {
                 repeat_timer->stop();
                 repeat_running = 1;
             }
         }
+
+#ifdef Q_OS_MACOS
+        // A new press (buttons, or the stick pushed like the D-pad): the
+        // controller is in use, so the mouse pointer gets out of the way.
+        // Only presses count, so motion-sensor noise never hides it.
+        if (buttons & ~old_buttons)
+            hideCursorUntilMouseMoves();
+#endif
 
         if ((old_buttons & escape_shortcut) == escape_shortcut && (buttons & escape_shortcut) != escape_shortcut)
             sendKey(Qt::Key_O, Qt::ControlModifier);
@@ -111,6 +139,21 @@ QString QmlController::GetGUID() const
 QString QmlController::GetVIDPID() const
 {
     return controller->GetVIDPIDString();
+}
+
+void QmlController::sendKeyEvent(QEvent::Type type, Qt::Key key)
+{
+    // Same aliased-device dedup as sendKey, per event type.
+    static QHash<QString, qint64> last_time_by_device;
+    const QString dedup_key = GetVIDPID() + QLatin1Char(':') + QString::number(static_cast<int>(key))
+        + QLatin1Char(':') + QString::number(static_cast<int>(type));
+    const qint64 now = QDateTime::currentMSecsSinceEpoch();
+    if (now - last_time_by_device.value(dedup_key, 0) < 50)
+        return;
+    last_time_by_device.insert(dedup_key, now);
+
+    QKeyEvent event(type, key, Qt::NoModifier);
+    QGuiApplication::sendEvent(target, &event);
 }
 
 void QmlController::sendKey(Qt::Key key, Qt::KeyboardModifiers modifiers)

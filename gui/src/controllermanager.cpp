@@ -128,7 +128,9 @@ static QSet<QPair<uint16_t, uint16_t>> chiaki_steam_virtual_controller_ids({
 
 static ControllerManager *instance = nullptr;
 
-#define UPDATE_INTERVAL_MS 4
+// P5M: read the controller every 1 ms (was 4): ~1.5 ms less input delay on
+// average, the DualSense reports at up to 1000 Hz.
+#define UPDATE_INTERVAL_MS 1
 #define MOVE_CHECK_MS 1000
 
 ControllerManager *ControllerManager::GetInstance()
@@ -154,6 +156,7 @@ ControllerManager::ControllerManager(QObject *parent)
 		return;
 
 	auto timer = new QTimer(this);
+	timer->setTimerType(Qt::PreciseTimer);
 	connect(timer, &QTimer::timeout, this, &ControllerManager::HandleEvents);
 	timer->start(UPDATE_INTERVAL_MS);
 	auto move_timer = new QTimer(this);

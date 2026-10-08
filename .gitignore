@@ -39,3 +39,24 @@ chiaki.conf
 .cache/
 *.vscode
 site/
+
+# Local credentials, captures and release output
+.env
+.env.*
+!.env.example
+*.log
+pacing_trace_*
+chiaki-settings.json
+*.p12
+*.pfx
+*.mobileprovision
+/dist/
+
+# Private assistant handoffs
+/HANDOFF*.md
+/AGENTS.md
+/CLAUDE.md
+
+# Generated Python caches
+__pycache__/
+*.py[cod]

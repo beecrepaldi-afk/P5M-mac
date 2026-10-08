@@ -9,6 +9,7 @@
 #include <QQuickWindow>
 #include <QLoggingCategory>
 #include <deque>
+#include <memory>
 #include <atomic>
 
 extern "C" {
@@ -38,6 +39,7 @@ extern "C" {
 Q_DECLARE_LOGGING_CATEGORY(chiakiGui);
 
 class Settings;
+class MetalRenderer;
 class StreamSession;
 class QmlBackend;
 class QOffscreenSurface;
@@ -65,6 +67,9 @@ class QmlMainWindow : public QWindow
     Q_PROPERTY(VideoPreset videoPreset READ videoPreset WRITE setVideoPreset NOTIFY videoPresetChanged)
     Q_PROPERTY(bool directStream READ directStream NOTIFY directStreamChanged)
     Q_PROPERTY(int runtimeRendererBackend READ runtimeRendererBackend CONSTANT)
+    Q_PROPERTY(bool fullscreen READ isFullscreen NOTIFY fullscreenChanged)
+    Q_PROPERTY(bool notchFill READ notchFill WRITE setNotchFill NOTIFY notchFillChanged)
+    Q_PROPERTY(int hiddenTop READ hiddenTop NOTIFY hiddenTopChanged)
     Q_PROPERTY(double queueDepthAverage READ queueDepthAverage NOTIFY queueDepthAverageChanged)
     Q_PROPERTY(double pendingFrameAge READ pendingFrameAge NOTIFY pendingFrameAgeChanged)
 
@@ -147,6 +152,11 @@ public:
     void setVideoPreset(VideoPreset mode);
 
     Q_INVOKABLE void grabInput();
+    Q_INVOKABLE void toggleFullscreen();
+    bool isFullscreen() const { return mac_fullscreen || windowState() == Qt::WindowFullScreen; }
+    bool notchFill() const;
+    void setNotchFill(bool fill);
+    int hiddenTop() const { return hidden_top; }
     Q_INVOKABLE void releaseInput();
     Q_INVOKABLE void requestOverlayUpdate();
     Q_INVOKABLE void setOverlayInteractionActive(bool active);
@@ -170,6 +180,9 @@ public slots:
     AVBufferRef *vulkanHwDeviceCtx();
 
 signals:
+    void fullscreenChanged();
+    void notchFillChanged();
+    void hiddenTopChanged();
     void hasVideoChanged();
     void droppedFramesChanged();
     void keepVideoChanged();
@@ -234,6 +247,8 @@ private:
     void beginFrame();
     void endFrame();
     void render();
+    void renderMetal(bool scheduled = true);
+    bool initMetal();
     void handleVulkanDeviceLost(const QString &reason);
     void handleVulkanRendererFallback(const QString &title, const QString &message, const QString &fallback_reason);
     void applyPendingFrame();
@@ -416,6 +431,15 @@ private:
     VkFormat quick_vk_format = VK_FORMAT_UNDEFINED;
     pl_tex quick_tex = {};
     QOpenGLFramebufferObject *quick_fbo = {};
+#if defined(Q_OS_MACOS)
+    std::unique_ptr<MetalRenderer> metal_renderer;
+    void scheduleDeferredMetalRender();
+    // A decoded frame posted straight to the render thread is waiting to be drawn.
+    QAtomicInteger<int> metal_frame_render_queued = 0;
+    QAtomicInteger<int> metal_present_deferred = 0;
+    bool mac_fullscreen = false; // borderless fullscreen (setMacBorderlessFullscreen)
+    int hidden_top = 0; // points hidden by the notch strip (macWindowHiddenTop)
+#endif
     VkSemaphore quick_sem = VK_NULL_HANDLE;
     uint64_t quick_sem_value = 0;
     VkImage quick_vk_image = VK_NULL_HANDLE;

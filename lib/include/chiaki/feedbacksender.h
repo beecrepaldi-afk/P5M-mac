@@ -29,6 +29,13 @@ typedef struct chiaki_feedback_sender_t
 	size_t history_packet_sizes[CHIAKI_FEEDBACK_HISTORY_PACKET_QUEUE_SIZE];
 	size_t history_packet_begin;
 	size_t history_packet_len;
+	// The last history packet goes out again a couple of times: nothing
+	// follows a release until the next button change, so one lost packet
+	// would leave the button held on the console.
+	uint8_t history_last[CHIAKI_FEEDBACK_HISTORY_PACKET_BUF_SIZE];
+	size_t history_last_size;
+	int history_tail_resends;
+	uint64_t history_last_ms;
 
 	bool should_stop;
 	ChiakiControllerState controller_state_prev;

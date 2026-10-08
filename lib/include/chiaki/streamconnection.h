@@ -33,6 +33,10 @@ typedef struct chiaki_stream_connection_t
 	ChiakiLog *log;
 	ChiakiTakion takion;
 	uint8_t *ecdh_secret;
+	size_t ecdh_secret_size;
+	/** Key exchange on secp521r1 for Takion 13 and later, replacing session->ecdh for this connection. */
+	ChiakiECDH ecdh_p521;
+	bool ecdh_p521_active;
 	ChiakiGKCrypt *gkcrypt_local;
 	ChiakiGKCrypt *gkcrypt_remote;
 	uint8_t *streaminfo_early_buf;

@@ -31,6 +31,7 @@
 #define SESSION_EXPECT_TIMEOUT_MS		5000
 
 #define SESSION_EXPECT_CTRL_START_MS    10000
+#define SESSION_EXPECT_CTRL_START_RUDP_MS 1500
 
 static void *session_thread_func(void *arg);
 static void regist_cb(ChiakiRegistEvent *event, void *user);
@@ -523,7 +524,12 @@ static void *session_thread_func(void *arg)
 	if(err != CHIAKI_ERR_SUCCESS)
 		QUIT(quit);
 
-	err = chiaki_cond_timedwait_pred(&session->state_cond, &session->state_mutex, SESSION_EXPECT_CTRL_START_MS, session_check_state_pred_ctrl_start, session);
+	// P5M: over PSN (rudp) the console sends the session id only after the
+	// data hole is punched, so this always ran into the full 10 s timeout
+	// (measured 03/10/2026). Wait just long enough for a login PIN request.
+	err = chiaki_cond_timedwait_pred(&session->state_cond, &session->state_mutex,
+		session->rudp ? SESSION_EXPECT_CTRL_START_RUDP_MS : SESSION_EXPECT_CTRL_START_MS,
+		session_check_state_pred_ctrl_start, session);
 	CHECK_STOP(quit_ctrl);
 
 	if(session->ctrl_failed)

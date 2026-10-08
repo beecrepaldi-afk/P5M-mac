@@ -380,7 +380,40 @@ static MunitResult test_gmac_multiple_of_key_refresh(const MunitParameter params
 }
 
 
+static MunitResult test_ecdh_p521(const MunitParameter params[], void *user)
+{
+	static const uint8_t handshake_key[] = { 0xfc, 0x5d, 0x4b, 0xa0, 0x3a, 0x35, 0x3a, 0xbb, 0x6a, 0x7f, 0xac, 0x79, 0x1b, 0x17, 0xbb, 0x34 };
+	ChiakiECDH a, b;
+	munit_assert_int(chiaki_ecdh_init_p521(&a), ==, CHIAKI_ERR_SUCCESS);
+	munit_assert_int(chiaki_ecdh_init_p521(&b), ==, CHIAKI_ERR_SUCCESS);
+	munit_assert_size(a.secret_size, ==, CHIAKI_ECDH_SECRET_SIZE_P521);
+
+	uint8_t key_a[160], key_b[160], sig_a[32], sig_b[32];
+	size_t key_a_size = sizeof(key_a), key_b_size = sizeof(key_b), sig_a_size = sizeof(sig_a), sig_b_size = sizeof(sig_b);
+	munit_assert_int(chiaki_ecdh_get_local_pub_key(&a, key_a, &key_a_size, handshake_key, sig_a, &sig_a_size), ==, CHIAKI_ERR_SUCCESS);
+	munit_assert_int(chiaki_ecdh_get_local_pub_key(&b, key_b, &key_b_size, handshake_key, sig_b, &sig_b_size), ==, CHIAKI_ERR_SUCCESS);
+	munit_assert_size(key_a_size, ==, 133);
+	munit_assert_uint8(key_a[0], ==, 0x04);
+
+	uint8_t secret_a[CHIAKI_ECDH_SECRET_SIZE_MAX], secret_b[CHIAKI_ECDH_SECRET_SIZE_MAX];
+	munit_assert_int(chiaki_ecdh_derive_secret(&a, secret_a, key_b, key_b_size, handshake_key, sig_b, sig_b_size), ==, CHIAKI_ERR_SUCCESS);
+	munit_assert_int(chiaki_ecdh_derive_secret(&b, secret_b, key_a, key_a_size, handshake_key, sig_a, sig_a_size), ==, CHIAKI_ERR_SUCCESS);
+	munit_assert_memory_equal(CHIAKI_ECDH_SECRET_SIZE_P521, secret_a, secret_b);
+
+	chiaki_ecdh_fini(&a);
+	chiaki_ecdh_fini(&b);
+	return MUNIT_OK;
+}
+
 MunitTest tests_gkcrypt[] = {
+	{
+		"/ecdh_p521",
+		test_ecdh_p521,
+		NULL,
+		NULL,
+		MUNIT_TEST_OPTION_NONE,
+		NULL
+	},
 	{
 		"/ecdh",
 		test_ecdh,

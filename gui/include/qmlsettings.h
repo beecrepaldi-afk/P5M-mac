@@ -33,6 +33,8 @@ class QmlSettings : public QObject
     Q_PROPERTY(bool showStreamStats READ showStreamStats WRITE setShowStreamStats NOTIFY showStreamStatsChanged)
     Q_PROPERTY(bool streamerMode READ streamerMode WRITE setStreamerMode NOTIFY streamerModeChanged)
     Q_PROPERTY(float hapticOverride READ hapticOverride WRITE setHapticOverride NOTIFY hapticOverrideChanged)
+    Q_PROPERTY(int macBluetoothHaptics READ macBluetoothHaptics WRITE setMacBluetoothHaptics NOTIFY macBluetoothHapticsChanged)
+    Q_PROPERTY(bool hdrOutput READ hdrOutput WRITE setHdrOutput NOTIFY hdrOutputChanged)
     Q_PROPERTY(int displayTargetContrast READ displayTargetContrast WRITE setDisplayTargetContrast NOTIFY displayTargetContrastChanged)
     Q_PROPERTY(int displayTargetPeak READ displayTargetPeak WRITE setDisplayTargetPeak NOTIFY displayTargetPeakChanged)
     Q_PROPERTY(int displayTargetPrim READ displayTargetPrim WRITE setDisplayTargetPrim NOTIFY displayTargetPrimChanged)
@@ -50,6 +52,8 @@ class QmlSettings : public QObject
     Q_PROPERTY(int codecRemotePS5 READ codecRemotePS5 WRITE setCodecRemotePS5 NOTIFY codecRemotePS5Changed)
     Q_PROPERTY(int audioBufferSize READ audioBufferSize WRITE setAudioBufferSize NOTIFY audioBufferSizeChanged)
     Q_PROPERTY(int audioVolume READ audioVolume WRITE setAudioVolume NOTIFY audioVolumeChanged)
+    Q_PROPERTY(bool macSpatialAudio READ macSpatialAudio WRITE setMacSpatialAudio NOTIFY macSpatialAudioChanged)
+    Q_PROPERTY(bool macHeadTracking READ macHeadTracking WRITE setMacHeadTracking NOTIFY macHeadTrackingChanged)
     Q_PROPERTY(QString audioInDevice READ audioInDevice WRITE setAudioInDevice NOTIFY audioInDeviceChanged)
     Q_PROPERTY(QString audioOutDevice READ audioOutDevice WRITE setAudioOutDevice NOTIFY audioOutDeviceChanged)
     Q_PROPERTY(QString decoder READ decoder WRITE setDecoder NOTIFY decoderChanged)
@@ -255,6 +259,10 @@ public:
 
     float hapticOverride() const;
     void setHapticOverride(float override);
+    int macBluetoothHaptics() const;
+    void setMacBluetoothHaptics(int mode);
+    bool hdrOutput() const;
+    void setHdrOutput(bool enabled);
 
     int fpsLocalPS4() const;
     void setFpsLocalPS4(int fps);
@@ -281,6 +289,11 @@ public:
 
     int audioBufferSize() const;
     void setAudioBufferSize(int size);
+
+    bool macSpatialAudio() const;
+    void setMacSpatialAudio(bool enabled);
+    bool macHeadTracking() const;
+    void setMacHeadTracking(bool enabled);
 
     int audioVolume() const;
     void setAudioVolume(int volume);
@@ -639,6 +652,8 @@ signals:
     void addSteamShortcutAskChanged();
     void hideCursorChanged();
     void hapticOverrideChanged();
+    void macBluetoothHapticsChanged();
+    void hdrOutputChanged();
     void audioVideoDisabledChanged();
     void showStreamStatsChanged();
     void streamerModeChanged();
@@ -659,6 +674,8 @@ signals:
     void displayTargetTrcChanged();
     void audioBufferSizeChanged();
     void audioVolumeChanged();
+    void macSpatialAudioChanged();
+    void macHeadTrackingChanged();
     void audioOutDeviceChanged();
     void audioInDeviceChanged();
     void wifiDroppedNotifChanged();

@@ -70,7 +70,8 @@ enum class PlaceboPreset {
 
 enum class RenderBackend {
 	Vulkan,
-	OpenGL
+	OpenGL,
+	Metal
 };
 
 enum class WindowType {
@@ -262,6 +263,9 @@ class Settings : public QObject
 		void SetLogSanitize(bool enabled)      { settings.setValue("settings/log_sanitize", enabled); }
 		bool GetVSyncEnabled() const           { return settings.value("settings/vsync", false).toBool(); }
 		void SetVSyncEnabled(bool enabled)     { settings.setValue("settings/vsync", enabled); }
+		// P5M (macOS, Metal): experimental HDR output on screens that have it.
+		bool GetHdrOutputEnabled() const       { return settings.value("settings/hdr_output", false).toBool(); }
+		void SetHdrOutputEnabled(bool enabled) { settings.setValue("settings/hdr_output", enabled); }
 		uint32_t GetLogLevelMask();
 
 		bool GetHideCursor() const				{ return settings.value("settings/hide_cursor", true).toBool(); }
@@ -304,6 +308,10 @@ class Settings : public QObject
 
 		float GetHapticOverride() const 			{ return settings.value("settings/haptic_override", 1.0).toFloat(); }
 		void SetHapticOverride(float override)	{ settings.setValue("settings/haptic_override", override); }
+		// P5M (macOS): haptics of a DualSense over Bluetooth. 0 raw track
+		// (HID report 0x32), 1 Apple Core Haptics, 2 rumble from the track (SDL).
+		int GetMacBluetoothHaptics() const			{ return settings.value("settings/mac_bt_haptics", 0).toInt(); }
+		void SetMacBluetoothHaptics(int mode)		{ settings.setValue("settings/mac_bt_haptics", mode); }
 
 		ChiakiVideoResolutionPreset GetResolutionLocalPS4() const;
 		ChiakiVideoResolutionPreset GetResolutionRemotePS4() const;
@@ -388,6 +396,11 @@ class Settings : public QObject
 
 		RegisteredHost GetAutoConnectHost() const;
 		void SetAutoConnectHost(const QByteArray &mac);
+
+		bool GetMacSpatialAudio() const;
+		void SetMacSpatialAudio(bool enabled);
+		bool GetMacHeadTracking() const;
+		void SetMacHeadTracking(bool enabled);
 
 		int GetAudioVolume() const;
 		void SetAudioVolume(int volume);

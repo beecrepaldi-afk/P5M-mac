@@ -3,6 +3,12 @@ cmake_minimum_required(VERSION 3.10)
 
 project(chiaki)
 
+if(APPLE)
+    # Caminhos de fontes não devem revelar a máquina nos binários públicos,
+    # inclusive constantes __FILE__ de bibliotecas estáticas.
+    add_compile_options("-ffile-prefix-map=${CMAKE_CURRENT_SOURCE_DIR}=.")
+endif()
+
 # Like option(), but the value can also be AUTO
 macro(tri_option name desc default)
     set("${name}" "${default}" CACHE STRING "${desc}")
@@ -57,9 +63,9 @@ set(CHIAKI_IS_SWITCH ${NSWITCH})
 
 if(APPLE)
 	if(CMAKE_HOST_SYSTEM_PROCESSOR STREQUAL "arm64")
-		set(CMAKE_OSX_DEPLOYMENT_TARGET 13.0 CACHE STRING "Minimum OS X deployment version" FORCE)
+		set(CMAKE_OSX_DEPLOYMENT_TARGET 13.0 CACHE STRING "Minimum OS X deployment version")
 	else()
-		set(CMAKE_OSX_DEPLOYMENT_TARGET 12.0 CACHE STRING "Minimum OS X deployment version" FORCE)
+		set(CMAKE_OSX_DEPLOYMENT_TARGET 12.0 CACHE STRING "Minimum OS X deployment version")
 	endif()
 endif()
 

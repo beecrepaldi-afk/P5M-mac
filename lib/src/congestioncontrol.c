@@ -24,6 +24,8 @@ static void *congestion_control_thread_func(void *user)
 		chiaki_packet_stats_get(control->stats, true, &received, &lost);
 		ChiakiTakionCongestionPacket packet = { 0 };
 		uint64_t total = received + lost;
+		control->total_received += received;
+		control->total_lost += lost;
 		control->packet_loss = total > 0 ? (double)lost / total : 0;
 		if(control->packet_loss > control->packet_loss_max)
 		{
@@ -49,6 +51,8 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_congestion_control_start(ChiakiCongestionCo
 	control->stats = stats;
 	control->packet_loss_max = packet_loss_max;
 	control->packet_loss = 0;
+	control->total_received = 0;
+	control->total_lost = 0;
 
 	ChiakiErrorCode err = chiaki_bool_pred_cond_init(&control->stop_cond);
 	if(err != CHIAKI_ERR_SUCCESS)

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: LicenseRef-AGPL-3.0-only-OpenSSL
 
 #include <streamsession.h>
+#include <cmath>
 #include <settings.h>
 #include <controllermanager.h>
 
@@ -12,6 +13,13 @@
 #include "../../lib/src/utils.h"
 
 #include <QKeyEvent>
+#include <QSettings>
+#ifdef Q_OS_MACOS
+#include "macStreamActivity.h"
+#endif
+#include <QCoreApplication>
+#include <QPointer>
+#include <QThread>
 #include <QMutexLocker>
 #include <QtMath>
 #include <atomic>
@@ -47,6 +55,8 @@
 #if CHIAKI_GUI_ENABLE_SPEEX
 #define ECHO_QUEUE_MAX 40
 #endif
+// Highest bitrate the learning will ask the PS5 for (kbps).
+static constexpr unsigned LEARN_MAX_KBPS = 100000;
 
 #if CHIAKI_GUI_ENABLE_STEAMDECK_NATIVE
 class SdeckHapticsWorker : public QObject
@@ -283,6 +293,8 @@ StreamSessionConnectInfo::StreamSessionConnectInfo(
 	log_level_mask = settings->GetLogLevelMask();
 	log_sanitize = settings->GetLogSanitize();
 	audio_volume = settings->GetAudioVolume();
+	mac_spatial_audio = settings->GetMacSpatialAudio();
+	mac_head_tracking = settings->GetMacHeadTracking();
 	log_file = CreateLogFilename();
 	// local connection
 	if(duid.isEmpty() && isLocalAddress(host))
@@ -314,7 +326,10 @@ StreamSessionConnectInfo::StreamSessionConnectInfo(
 	this->port_guess_socket_count = settings->GetPortGuessSocketCount();
 	this->packet_loss_max = settings->GetPacketLossReportedMax();
 	this->audio_video_disabled = settings->GetAudioVideoDisabled();
-	this->haptic_override = settings->GetHapticOverride();
+	// P5M: the PS5's own vibration setting is the one control; a second
+	// scale here only doubled it (and a stale value silently weakened it).
+	this->haptic_override = 1.0f;
+	this->mac_bt_haptics = settings->GetMacBluetoothHaptics();
 #if CHIAKI_GUI_ENABLE_STEAMDECK_NATIVE
 	this->enable_steamdeck_haptics = settings->GetSteamDeckHapticsEnabled();
 	this->vertical_sdeck = settings->GetVerticalDeckEnabled();
@@ -436,6 +451,10 @@ StreamSession::StreamSession(const StreamSessionConnectInfo &connect_info, QObje
 	}
 #endif
 	audio_volume = connect_info.audio_volume;
+#ifdef Q_OS_MACOS
+	mac_spatial_audio = connect_info.mac_spatial_audio;
+	mac_head_tracking = connect_info.mac_head_tracking;
+#endif
 	start_mic_unmuted = connect_info.start_mic_unmuted;
 	audio_out_device_name = connect_info.audio_out_device;
 	audio_in_device_name = connect_info.audio_in_device;
@@ -470,6 +489,31 @@ StreamSession::StreamSession(const StreamSessionConnectInfo &connect_info, QObje
 	chiaki_connect_info.ps5 = chiaki_target_is_ps5(connect_info.target);
 	chiaki_connect_info.host = host_str.constData();
 	chiaki_connect_info.video_profile = connect_info.video_profile;
+	// Two output blocks queued until this network has taught us better.
+	audio_target_ms = 2.0 * audio_buffer_size / (sizeof(int16_t) * 2) * 1000.0 / audio_out_rate;
+#ifdef Q_OS_MACOS
+	{
+		// P5M learning: what this network allowed last time (per router,
+		// home and away apart). The bitrate setting is only where a new
+		// network starts: clean sessions keep climbing until the network
+		// loses packets, and that point becomes the ceiling.
+		const bool local = connect_info.duid.isEmpty() && isLocalAddress(connect_info.host);
+		QString net = macNetworkKey();
+		if(!net.isEmpty())
+		{
+			learn_key = QStringLiteral("learn/%1-%2").arg(local ? QStringLiteral("local") : QStringLiteral("remote"), net.replace(QLatin1Char(':'), QLatin1Char('-')));
+			QSettings learn;
+			learn_cap_kbps = learn.value(learn_key + QStringLiteral("/bad_kbps"), 0).toUInt();
+			const unsigned learned = learn.value(learn_key + QStringLiteral("/bitrate_kbps"), 0).toUInt();
+			if(learned)
+				chiaki_connect_info.video_profile.bitrate = std::min(learned, LEARN_MAX_KBPS);
+			learn_used_kbps = chiaki_connect_info.video_profile.bitrate;
+			const double queue = learn.value(learn_key + QStringLiteral("/audio_queue_ms"), 0).toDouble();
+			if(queue > 0)
+				audio_target_ms = queue;
+		}
+	}
+#endif
 	chiaki_connect_info.video_profile_auto_downgrade = true;
 	chiaki_connect_info.enable_keyboard = false;
 	chiaki_connect_info.enable_idr_on_fec_failure = connect_info.enable_idr_on_fec_failure;
@@ -483,6 +527,9 @@ StreamSession::StreamSession(const StreamSessionConnectInfo &connect_info, QObje
 	dpad_touch_shortcut3 = connect_info.dpad_touch_shortcut3;
 	dpad_touch_shortcut4 = connect_info.dpad_touch_shortcut4;
 	haptic_override = connect_info.haptic_override;
+#ifdef Q_OS_MACOS
+	mac_bt_haptics = connect_info.mac_bt_haptics;
+#endif
 #if CHIAKI_LIB_ENABLE_PI_DECODER
 	if(connect_info.decoder == Decoder::Pi && chiaki_connect_info.video_profile.codec != CHIAKI_CODEC_H264)
 	{
@@ -693,15 +740,131 @@ StreamSession::StreamSession(const StreamSessionConnectInfo &connect_info, QObje
 		}
 	});
 
-	StartAudioOutDrainThread();
+}
+
+void StreamSession::LearnFromSession()
+{
+	if(learn_saved || learn_key.isEmpty() || !learn_timer.isValid())
+		return;
+	learn_saved = true;
+	const double minutes = learn_timer.elapsed() / 60000.0;
+	QSettings learn;
+	learn.setValue(learn_key + QStringLiteral("/audio_queue_ms"), audio_target_ms.load());
+	if(minutes < 1.0)
+		return; // too short to judge the bitrate
+	const uint64_t rx = session.stream_connection.congestion_control.total_received;
+	const uint64_t lost = session.stream_connection.congestion_control.total_lost;
+	const double loss = rx + lost ? double(lost) / double(rx + lost) : 0.0;
+	const double lost_per_min = frames_lost / minutes;
+	// learn_cap_kbps is the lowest bitrate that lost packets on this
+	// network (0 = none yet). Climb by a fifth while nothing is known,
+	// then halfway to that point; on loss, step back and mark it.
+	unsigned bad = learn_cap_kbps;
+	int clean_at_top = learn.value(learn_key + QStringLiteral("/clean_at_top"), 0).toInt();
+	unsigned next = learn_used_kbps;
+	const char *what = "kept";
+	if(loss > 0.01 || lost_per_min > 3)
+	{
+		bad = bad ? std::min(bad, learn_used_kbps) : learn_used_kbps;
+		next = std::max(8000u, unsigned(learn_used_kbps * 0.85));
+		clean_at_top = 0;
+		what = "lowered";
+	}
+	else if(loss < 0.002 && lost_per_min < 0.5)
+	{
+		unsigned up = std::min(LEARN_MAX_KBPS, unsigned(learn_used_kbps * 1.2));
+		if(bad)
+		{
+			up = std::min(up, learn_used_kbps + (bad > learn_used_kbps ? (bad - learn_used_kbps) / 2 : 0));
+			if(up < learn_used_kbps + 2000)
+			{
+				// Right under the known limit. Networks change: after five
+				// clean sessions here, try above it again.
+				if(++clean_at_top >= 5)
+				{
+					bad = 0;
+					clean_at_top = 0;
+					up = std::min(LEARN_MAX_KBPS, unsigned(learn_used_kbps * 1.1));
+				}
+				else
+					up = learn_used_kbps;
+			}
+		}
+		if(up > learn_used_kbps)
+		{
+			next = up;
+			what = "raised";
+		}
+	}
+	next = next / 1000 * 1000;
+	learn.setValue(learn_key + QStringLiteral("/bitrate_kbps"), next);
+	learn.setValue(learn_key + QStringLiteral("/bad_kbps"), bad);
+	learn.setValue(learn_key + QStringLiteral("/clean_at_top"), clean_at_top);
+	learn.setValue(learn_key + QStringLiteral("/sessions"), learn.value(learn_key + QStringLiteral("/sessions"), 0).toInt() + 1);
+	CHIAKI_LOGI(log.GetChiakiLog(), "[learn] %.1f min, packet loss %.2f%%, %.1f frames lost/min: next bitrate %s %u -> %u kbps (lost packets at %u, 0 = not yet), sound queue %.1f ms",
+		minutes, loss * 100.0, lost_per_min, what, learn_used_kbps, next, bad, audio_target_ms.load());
 }
 
 StreamSession::~StreamSession()
 {
+	shutting_down.store(true);
 	mic_active.storeRelaxed(false);
+	if(session_started)
+	{
+		// The app can be torn down with the stream still running (quit while
+		// connected): stop it first, or the join waits on the network forever.
+		chiaki_session_stop(&session);
+		chiaki_session_join(&session);
+	}
+
+	// As callbacks de áudio e congestionamento pertencem às threads da sessão.
+	// Mantenha buffers e diário vivos até chiaki_session_join() terminar.
+	LearnFromSession();
+#ifdef Q_OS_MACOS
+	// O produtor já saiu; close espera o consumidor CoreAudio antes de liberar PCM.
+	mac_audio_output.reset();
+	// The takion thread (the only pusher) is joined: the sender can go.
+	bt_haptics_live.store(nullptr);
+	bt_haptics.reset();
+#endif
+
+	if(haptics_opener_thread)
+	{
+		QThread *opener = haptics_opener_thread.data();
+		if(opener->isRunning())
+			opener->wait();
+		delete opener;
+		haptics_opener_thread = nullptr;
+	}
+	SDL_AudioDeviceID pending_haptics_device = 0;
+	SDL_AudioDeviceID connected_haptics_device = 0;
+	{
+		QMutexLocker locker(&haptics_opener_mutex);
+		pending_haptics_device = haptics_opener_result;
+		haptics_opener_result = 0;
+		connected_haptics_device = haptics_output;
+		haptics_output = 0;
+	}
+	if(pending_haptics_device > 0)
+		SDL_CloseAudioDevice(pending_haptics_device);
+	if(connected_haptics_device > 0)
+		SDL_CloseAudioDevice(connected_haptics_device);
+
+#if CHIAKI_GUI_ENABLE_STEAMDECK_NATIVE
+	StopSdeckHaptics();
+#endif
+
 	StopAudioOutDrainThread();
 	if(audio_out)
+	{
 		SDL_CloseAudioDevice(audio_out);
+		audio_out = 0;
+	}
+	if(audio_in)
+	{
+		SDL_CloseAudioDevice(audio_in);
+		audio_in = 0;
+	}
 	{
 		QMutexLocker locker(&audio_out_ring_mutex);
 		audio_out_ring_buf.clear();
@@ -710,19 +873,7 @@ StreamSession::~StreamSession()
 		audio_out_ring_fill = 0;
 		audio_out_overflow_logged = false;
 	}
-	if(audio_in)
-		SDL_CloseAudioDevice(audio_in);
 
-#if CHIAKI_GUI_ENABLE_STEAMDECK_NATIVE
-	StopSdeckHaptics();
-#endif
-
-	// Prepare log for shutdown BEFORE joining session threads
-	// This prevents crashes from log callbacks during shutdown
-	log.PrepareShutdown();
-
-	if(session_started)
-		chiaki_session_join(&session);
 	chiaki_session_fini(&session);
 	chiaki_opus_decoder_fini(&opus_decoder);
 	chiaki_opus_encoder_fini(&opus_encoder);
@@ -762,11 +913,6 @@ StreamSession::~StreamSession()
 		chiaki_ffmpeg_decoder_fini(ffmpeg_decoder);
 		delete ffmpeg_decoder;
 	}
-	if (haptics_output > 0)
-	{
-		SDL_CloseAudioDevice(haptics_output);
-		haptics_output = 0;
-	}
 	if (haptics_resampler_buf)
 	{
 		free(haptics_resampler_buf);
@@ -796,6 +942,8 @@ StreamSession::~StreamSession()
 		}
 	}
 #endif
+	// Todos os produtores e a abertura assíncrona do dispositivo terminaram.
+	log.PrepareShutdown();
 }
 
 void StreamSession::Start()
@@ -1211,8 +1359,9 @@ void StreamSession::UpdateGamepads()
 void StreamSession::WaitHaptics()
 {
 	ConnectHaptics();
-	if(!(this->haptics_output > 0))
-		QTimer::singleShot(14000, this, &StreamSession::ConnectHaptics);
+	// ConnectHaptics finishes asynchronously; the retry is a no-op once it
+	// has connected or while it is still trying.
+	QTimer::singleShot(14000, this, &StreamSession::ConnectHaptics);
 }
 
 void StreamSession::DpadSendFeedbackState()
@@ -1327,12 +1476,30 @@ void StreamSession::SendFeedbackState()
 	chiaki_session_set_controller_state(&session, &state);
 }
 
+void StreamSession::SetAudioOutputStatus(const QString &status)
+{
+	// Status pertence à GUI; o produtor de áudio nunca escreve a QString dela.
+	QMetaObject::invokeMethod(this, [this, status]() {
+		if(audio_output_status != status)
+		{
+			audio_output_status = status;
+			emit AudioOutputChanged();
+		}
+	}, Qt::QueuedConnection);
+}
+
 void StreamSession::InitAudio(unsigned int channels, unsigned int rate)
 {
 	StopAudioOutDrainThread();
-	allow_unmute = true;
-	if(start_mic_unmuted)
-		ToggleMute();
+#ifdef Q_OS_MACOS
+	mac_audio_output.reset();
+#endif
+	QMetaObject::invokeMethod(this, [this]() {
+		const bool first_format = !allow_unmute;
+		allow_unmute = true;
+		if(first_format && start_mic_unmuted && muted)
+			ToggleMute();
+	}, Qt::QueuedConnection);
 	if(audio_out)
 	{
 		SDL_CloseAudioDevice(audio_out);
@@ -1347,6 +1514,38 @@ void StreamSession::InitAudio(unsigned int channels, unsigned int rate)
 		audio_out_overflow_logged = false;
 	}
 
+	if(!rate || !channels || channels > UINT8_MAX)
+	{
+		SetAudioOutputStatus(QStringLiteral("Audio unavailable: invalid stream format"));
+		CHIAKI_LOGE(log.GetChiakiLog(), "Audio output rejected an invalid format: %u channels @ %u Hz", channels, rate);
+		return;
+	}
+	audio_out_rate = rate;
+	audio_out_channels = channels;
+	audio_out_sample_size = sizeof(int16_t) * channels;
+#ifdef Q_OS_MACOS
+	mac_audio_reopen_us = chiaki_time_now_monotonic_us();
+	mac_audio_output = std::make_unique<MacAudioOutput>();
+	mac_audio_last_underruns = 0;
+	std::string native_error;
+	if(mac_audio_output->open(rate, static_cast<uint8_t>(channels), audio_out_device_name.toUtf8().toStdString(),
+		mac_spatial_audio, mac_head_tracking, static_cast<uint32_t>(audio_target_ms.load()), native_error))
+	{
+		const QString mode = QString::fromStdString(mac_audio_output->description());
+		SetAudioOutputStatus(mode);
+		CHIAKI_LOGI(log.GetChiakiLog(), "Audio: %s (%u channels @ %u Hz)", qPrintable(mode), channels, rate);
+		return;
+	}
+	mac_audio_output.reset();
+	CHIAKI_LOGW(log.GetChiakiLog(), "CoreAudio unavailable: %s; trying regular audio output", native_error.c_str());
+	if(channels > 2)
+	{
+		// Não enviar um layout Sony desconhecido a uma saída que suponha WAVE.
+		SetAudioOutputStatus(QStringLiteral("Audio unavailable: the surround channel layout is not verified"));
+		CHIAKI_LOGE(log.GetChiakiLog(), "Surround output rejected: the stream channel layout is not verified");
+		return;
+	}
+#endif
 	SDL_AudioSpec spec = {0};
 	spec.freq = rate;
 	spec.channels = channels;
@@ -1360,17 +1559,19 @@ void StreamSession::InitAudio(unsigned int channels, unsigned int rate)
 	{
 		CHIAKI_LOGE(log.GetChiakiLog(), "Failed to open Audio Output Device '%s': %s", qPrintable(audio_out_device_name), SDL_GetError());
 		if(audio_out_device_name.isEmpty())
+		{
+			SetAudioOutputStatus(QStringLiteral("Audio unavailable: regular output could not open"));
 			return;
+		}
 		audio_out_device_name.clear();
 		audio_out = SDL_OpenAudioDevice(nullptr, false, &spec, &obtained, false);
 		if(!audio_out)
 		{
+			SetAudioOutputStatus(QStringLiteral("Audio unavailable: default output could not open"));
 			CHIAKI_LOGE(log.GetChiakiLog(), "Failed to open default Audio Output Device: %s", SDL_GetError());
 			return;
 		}
 	}
-	if(audio_out_device_name.isEmpty())
-		audio_out_device_name = "Auto";
 
 	if(obtained.format != spec.format || obtained.channels != spec.channels || obtained.freq != spec.freq)
 		CHIAKI_LOGW(log.GetChiakiLog(),
@@ -1388,6 +1589,7 @@ void StreamSession::InitAudio(unsigned int channels, unsigned int rate)
 
 	SDL_PauseAudioDevice(audio_out, 0);
 	StartAudioOutDrainThread();
+	SetAudioOutputStatus(QStringLiteral("Regular audio output · %1-channel input · %2 Hz").arg(channels).arg(rate));
 
 	CHIAKI_LOGI(log.GetChiakiLog(), "Audio Device '%s' opened with %u channels @ %d Hz, buffer size %u",
 				qPrintable(audio_out_device_name), obtained.channels, obtained.freq, obtained.size);
@@ -1803,6 +2005,30 @@ void StreamSession::QueueRumbleHaptics(uint16_t strength)
 	rumble_haptics.enqueue(strength);
 }
 
+#ifdef Q_OS_MACOS
+void StreamSession::StartBluetoothHaptics()
+{
+	if(bt_haptics || haptics_output > 0)
+		return;
+	if(mac_bt_haptics == 2)
+	{
+		CHIAKI_LOGI(log.GetChiakiLog(), "[haptics-bt] set to rumble; haptics stay as rumble");
+		return;
+	}
+	if(mac_bt_haptics == 1)
+		bt_haptics = MacDualSenseCoreHaptics::Open(log.GetChiakiLog());
+	else
+		bt_haptics = MacDualSenseBluetooth::Open(log.GetChiakiLog());
+	if(!bt_haptics)
+	{
+		CHIAKI_LOGI(log.GetChiakiLog(), "[haptics-bt] no DualSense for %s; haptics stay as rumble",
+			mac_bt_haptics == 1 ? "Core Haptics" : "the raw track over Bluetooth");
+		return;
+	}
+	bt_haptics_live.store(bt_haptics.get(), std::memory_order_release);
+}
+#endif
+
 void StreamSession::ConnectHaptics()
 {
 	if (this->haptics_output > 0)
@@ -1810,6 +2036,8 @@ void StreamSession::ConnectHaptics()
 		CHIAKI_LOGW(this->log.GetChiakiLog(), "Haptics already connected to an attached DualSense controller, ignoring additional controllers.");
 		return;
 	}
+	if (haptics_connecting)
+		return;
 	if (!haptics_resampler_buf)
 	{
 		CHIAKI_LOGW(this->log.GetChiakiLog(), "Haptics resampler buf wasn't allocated, can't use haptics.");
@@ -1818,42 +2046,90 @@ void StreamSession::ConnectHaptics()
 #ifdef Q_OS_MACOS
 	CHIAKI_LOGW(this->log.GetChiakiLog(), "If haptics aren't working, please configure your DualSense audio device as quadrophonic in Applications/Utitilities/Audio Midi Setup on your Mac");
 #endif
-	SDL_AudioSpec want, have;
-	SDL_zero(want);
-	want.freq = 48000;
-	want.format = AUDIO_S16SYS;
-	want.channels = 4;
-	want.samples = haptics_buffer_size;
-	want.callback = NULL;
+	// Opening the DualSense audio device blocks for about a second (CoreAudio
+	// sets the device up synchronously), so do it off the GUI thread and hand
+	// the result back. If the session is gone by then, close the device.
+	haptics_connecting = true;
+	QPointer<StreamSession> self(this);
+	ChiakiLog *haptics_log = log.GetChiakiLog();
+	const Uint16 samples = haptics_buffer_size;
+	QThread *opener = QThread::create([self, haptics_log, samples]() {
+		SDL_AudioSpec want, have;
+		SDL_zero(want);
+		want.freq = 48000;
+		want.format = AUDIO_S16SYS;
+		want.channels = 4;
+		want.samples = samples;
+		want.callback = NULL;
 
-	const char *device_name = nullptr;
-	for (int i=0; i < SDL_GetNumAudioDevices(0); i++)
-	{
-		device_name = SDL_GetAudioDeviceName(i, 0);
-		if (!device_name || !strstr(device_name, DUALSENSE_AUDIO_DEVICE_NEEDLE))
+		SDL_AudioDeviceID device = 0;
+		bool found = false;
+		for (int i=0; i < SDL_GetNumAudioDevices(0); i++)
 		{
-			continue;
-		}
-		haptics_output = SDL_OpenAudioDevice(device_name, 0, &want, &have, 0);
-		if (haptics_output == 0)
-		{
-			CHIAKI_LOGE(log.GetChiakiLog(), "Could not open SDL Audio Device %s for haptics output: %s", device_name, SDL_GetError());
-			continue;
-		}
-		SDL_PauseAudioDevice(haptics_output, 0);
-		CHIAKI_LOGI(log.GetChiakiLog(), "Haptics Audio Device '%s' opened with %d channels @ %d Hz, buffer size %u (driver=%s)", device_name, have.channels, have.freq, have.size, SDL_GetCurrentAudioDriver());
-		QMetaObject::invokeMethod(this, [this]() {
-			const uint8_t clear_effect[10] = { 0 };
-			for(auto controller : controllers)
+			const char *device_name = SDL_GetAudioDeviceName(i, 0);
+			if (!device_name || !strstr(device_name, DUALSENSE_AUDIO_DEVICE_NEEDLE))
+				continue;
+			found = true;
+			device = SDL_OpenAudioDevice(device_name, 0, &want, &have, 0);
+			if (device == 0)
 			{
-				if(controller->IsDualSense() || controller->IsDualSenseEdge())
-					controller->SetTriggerEffects(0x05, clear_effect, 0x05, clear_effect);
+				CHIAKI_LOGE(haptics_log, "Could not open SDL Audio Device %s for haptics output: %s", device_name, SDL_GetError());
+				continue;
+			}
+			SDL_PauseAudioDevice(device, 0);
+			CHIAKI_LOGI(haptics_log, "Haptics Audio Device '%s' opened with %d channels @ %d Hz, buffer size %u (driver=%s)", device_name, have.channels, have.freq, have.size, SDL_GetCurrentAudioDriver());
+			break;
+		}
+		if (!found)
+			CHIAKI_LOGW(haptics_log, "DualSense features were enabled and a DualSense is connected, but could not find the DualSense audio device!");
+
+		if(device > 0)
+		{
+			if(!self)
+			{
+				SDL_CloseAudioDevice(device);
+				return;
+			}
+			QMutexLocker locker(&self->haptics_opener_mutex);
+			self->haptics_opener_result = device;
+		}
+
+		QMetaObject::invokeMethod(qApp, [self]() {
+			if (!self)
+				return;
+			SDL_AudioDeviceID device = 0;
+			bool close_device = false;
+			{
+				QMutexLocker locker(&self->haptics_opener_mutex);
+				device = self->haptics_opener_result;
+				self->haptics_opener_result = 0;
+				self->haptics_connecting = false;
+#ifdef Q_OS_MACOS
+				if(device == 0 && !self->shutting_down.load() && self->haptics_output == 0)
+					self->StartBluetoothHaptics();
+#endif
+				if(self->shutting_down.load())
+					close_device = device > 0;
+				else if(device > 0 && self->haptics_output > 0)
+					close_device = true;
+				else if(device > 0)
+				{
+					self->haptics_output = device;
+					const uint8_t clear_effect[10] = { 0 };
+					for(auto controller : self->controllers)
+					{
+						if(controller->IsDualSense() || controller->IsDualSenseEdge())
+							controller->SetTriggerEffects(0x05, clear_effect, 0x05, clear_effect);
+					}
+				}
+				if(close_device)
+					SDL_CloseAudioDevice(device);
 			}
 		});
-		return;
-	}
-	CHIAKI_LOGW(log.GetChiakiLog(), "DualSense features were enabled and a DualSense is connected, but could not find the DualSense audio device!");
-	return;
+	});
+	QObject::connect(opener, &QThread::finished, opener, &QObject::deleteLater);
+	haptics_opener_thread = opener;
+	opener->start();
 }
 
 #if CHIAKI_GUI_ENABLE_STEAMDECK_NATIVE
@@ -1908,14 +2184,143 @@ void StreamSession::StopSdeckHaptics()
 
 void StreamSession::PushAudioFrame(int16_t *og_buf, size_t samples_count)
 {
-	if(!audio_out || !audio_volume)
+#ifdef Q_OS_MACOS
+	if((mac_audio_output && mac_audio_output->needsReopen()) ||
+		(!mac_audio_output && !audio_out && audio_out_sample_size && audio_out_channels <= 2))
+	{
+		const uint64_t now = chiaki_time_now_monotonic_us();
+		if(now - mac_audio_reopen_us >= 1000000)
+		{
+			mac_audio_reopen_us = now;
+			CHIAKI_LOGI(log.GetChiakiLog(), "Audio output changed or unavailable; retrying the playback route");
+			InitAudio(audio_out_channels, audio_out_rate);
+		}
+	}
+	const bool native_audio = mac_audio_output && mac_audio_output->isReady();
+#else
+	const bool native_audio = false;
+#endif
+	const int frame_volume = audio_volume.load(std::memory_order_relaxed);
+	if((!audio_out && !native_audio) || !audio_out_rate || !audio_out_sample_size)
 		return;
+	if(!frame_volume)
+	{
+		// Silêncio escolhido pelo usuário não é uma falha da rede. Na volta,
+		// reinicie a janela/grace period sem aumentar a reserva por esse intervalo.
+		audio_last_frame_us = 0;
+		return;
+	}
 
 	QByteArray buf((int)(samples_count * audio_out_sample_size), 0);
 
+	{
+		// P5M diary: how much sound waits in the output queue (that is the
+		// delay of the sound after the picture) and how often it ran dry
+		// (a gap you hear). One line every 10 s.
+		const uint64_t now = chiaki_time_now_monotonic_us();
+		const bool resumed = audio_last_frame_us && now - audio_last_frame_us > 1000000;
+		if(!audio_last_frame_us || resumed)
+		{
+			// Ao retomar o som, comece uma janela nova. A primeira amostra da
+			// fila fica fora do mínimo calculado abaixo.
+			audio_window_start_us = now;
+			audio_queued_sum_us = audio_queued_max_us = 0;
+			audio_queued_min_us = UINT64_MAX;
+			audio_window_frames = audio_window_dry = 0;
+			audio_last_raise_us = 0;
+			audio_first_frame_us = now;
+			audio_clean_windows = 0;
+			audio_pcm_peak = 0;
+			audio_full_scale_samples = audio_measured_samples = 0;
+		}
+		// Só níveis agregados, sem guardar o áudio ou seu conteúdo.
+		const size_t pcm_samples = samples_count * audio_out_channels;
+		for(size_t i = 0; i < pcm_samples; ++i)
+		{
+			const int value = og_buf[i];
+			audio_pcm_peak = std::max(audio_pcm_peak, unsigned(value < 0 ? -value : value));
+			if(value == INT16_MIN || value == INT16_MAX)
+				++audio_full_scale_samples;
+		}
+		audio_measured_samples += pcm_samples;
+		size_t queued = audio_out ? SDL_GetQueuedAudioSize(audio_out) : 0;
+		uint64_t native_underruns = 0;
+		double device_latency_ms = audio_out_sample_size ? audio_buffer_size / audio_out_sample_size * 1000.0 / audio_out_rate : 0.0;
+#ifdef Q_OS_MACOS
+		if(native_audio)
+		{
+			queued = mac_audio_output->queuedBytes();
+			native_underruns = mac_audio_output->underruns();
+			device_latency_ms = mac_audio_output->latencyMs();
+		}
+#endif
+		const uint64_t queued_us = audio_out_sample_size ? uint64_t(queued) / audio_out_sample_size * 1000000ull / audio_out_rate : 0;
+		audio_queued_sum_us += queued_us;
+		audio_queued_max_us = std::max(audio_queued_max_us, queued_us);
+		if(audio_window_frames > 0)
+			audio_queued_min_us = std::min(audio_queued_min_us, queued_us);
+		audio_last_frame_us = now;
+		// The queue starts empty: the first two seconds do not count.
+		bool ran_dry = queued == 0;
+#ifdef Q_OS_MACOS
+		if(native_audio)
+		{
+			ran_dry = native_underruns > mac_audio_last_underruns;
+			mac_audio_last_underruns = native_underruns;
+		}
+#endif
+		if(ran_dry && audio_window_frames > 0 && now - audio_first_frame_us > 2000000)
+		{
+			// Ran dry (a gap you hear): queue more from now on. One raise per
+			// stall: a single network hiccup empties it several frames in a row.
+			audio_window_dry++;
+			if(now - audio_last_raise_us > 1000000)
+			{
+				audio_target_ms = std::min(80.0, audio_target_ms.load() + 5.0);
+				audio_last_raise_us = now;
+			}
+		}
+		audio_window_frames++;
+		if(now - audio_window_start_us >= 10000000)
+		{
+			CHIAKI_LOGI(log.GetChiakiLog(), "[audio] 10s: %u frames of %zu samples, queued min %.1f avg %.1f max %.1f ms (+%.0f ms device buffer), ran dry %u times, target %.1f ms",
+				audio_window_frames, samples_count, audio_queued_min_us == UINT64_MAX ? 0.0 : audio_queued_min_us / 1000.0, audio_queued_sum_us / 1000.0 / audio_window_frames, audio_queued_max_us / 1000.0,
+				device_latency_ms, audio_window_dry, audio_target_ms.load());
+			double trimmed_ms = 0;
+#ifdef Q_OS_MACOS
+			if(native_audio)
+				trimmed_ms = mac_audio_output->trimmedFrames() * 1000.0 / audio_out_rate;
+#endif
+			CHIAKI_LOGI(log.GetChiakiLog(), "[audio-level] 10s: input peak %.1f dBFS, full-scale samples %llu/%llu (%.4f%%), volume %.0f%%, native trimmed total %.1f ms",
+				audio_pcm_peak ? 20.0 * std::log10(audio_pcm_peak / 32768.0) : -120.0,
+				(unsigned long long)audio_full_scale_samples, (unsigned long long)audio_measured_samples,
+				audio_measured_samples ? audio_full_scale_samples * 100.0 / audio_measured_samples : 0.0,
+				frame_volume * 100.0 / SDL_MIX_MAXVOLUME, trimmed_ms);
+			audio_pcm_peak = 0;
+			audio_full_scale_samples = audio_measured_samples = 0;
+			const double block_ms = audio_out_sample_size ? audio_buffer_size / audio_out_sample_size * 1000.0 / audio_out_rate : 10.0;
+			const bool spare = audio_window_dry == 0 && audio_queued_min_us != UINT64_MAX && audio_queued_min_us > 8000;
+			if(native_audio)
+			{
+				// Uma janela boa não basta para retirar a reserva recém-aprendida.
+				// Três janelas estáveis; redução gradual evita oscilação e cortes.
+				if(!spare)
+					audio_clean_windows = 0;
+				else if(++audio_clean_windows >= 3)
+					audio_target_ms = std::max(block_ms, audio_target_ms.load() - 2.5);
+			}
+			else if(spare)
+				audio_target_ms = std::max(block_ms, audio_target_ms.load() - std::max(2.5, (audio_queued_min_us / 1000.0 - 8.0) / 2));
+			audio_window_start_us = now;
+			audio_queued_sum_us = audio_queued_max_us = 0;
+			audio_queued_min_us = UINT64_MAX;
+			audio_window_frames = audio_window_dry = 0;
+		}
+	}
+
 	// qDebug() << "Audio queue" << (SDL_GetQueuedAudioSize(audio_out) / audio_out_sample_size / samples_count) * 10 << "ms";
 	// If the SDL queue runs away, drop the stale backlog and resume from the latest frame.
-	if(SDL_GetQueuedAudioSize(audio_out) > 3 * audio_buffer_size)
+	if(audio_out && SDL_GetQueuedAudioSize(audio_out) > size_t(audio_target_ms.load() * audio_out_rate / 1000.0 * audio_out_sample_size) + 2 * audio_buffer_size)
 	{
 		CHIAKI_LOGW(log.GetChiakiLog(), "Audio queue exceeded latency threshold, clearing queued audio");
 		SDL_ClearQueuedAudio(audio_out);
@@ -1925,13 +2330,13 @@ void StreamSession::PushAudioFrame(int16_t *og_buf, size_t samples_count)
 		audio_out_ring_fill = 0;
 		audio_out_overflow_logged = false;
 	}
-	if(audio_volume < SDL_MIX_MAXVOLUME)
-		SDL_MixAudioFormat((uint8_t *)buf.data(), (uint8_t *)og_buf, AUDIO_S16SYS, buf.size(), audio_volume);
+	if(frame_volume < SDL_MIX_MAXVOLUME)
+		SDL_MixAudioFormat((uint8_t *)buf.data(), (uint8_t *)og_buf, AUDIO_S16SYS, buf.size(), frame_volume);
 	else
 		memcpy(buf.data(), og_buf, (size_t)buf.size());
 #if CHIAKI_GUI_ENABLE_SPEEX
 	// change samples to mono for processing with SPEEX
-	if(echo_resampler_buf && speech_processing_enabled && !muted)
+	if(audio_out_channels == 2 && audio_out_rate == 48000 && echo_resampler_buf && speech_processing_enabled && !muted)
 	{
 		if(buf.size() != (int)(mic_buf.size_bytes * 2))
 		{
@@ -1957,6 +2362,18 @@ void StreamSession::PushAudioFrame(int16_t *og_buf, size_t samples_count)
 	}
 #endif
 queue_audio:
+#ifdef Q_OS_MACOS
+	if(native_audio)
+	{
+		mac_audio_output->setTargetMs(audio_target_ms.load());
+		if(!mac_audio_output->queue(reinterpret_cast<const int16_t *>(buf.constData()), samples_count) && !audio_out_overflow_logged)
+		{
+			CHIAKI_LOGW(log.GetChiakiLog(), "CoreAudio queue rejected an audio frame; playback will retry with the next frame");
+			audio_out_overflow_logged = true;
+		}
+		return;
+	}
+#endif
 	QueueAudioOutData(buf);
 }
 
@@ -2007,11 +2424,12 @@ void StreamSession::QueueAudioOutData(const QByteArray &audio_data)
 
 void StreamSession::DrainAudioOutRingBuffer()
 {
-	const size_t target_queue_size = audio_buffer_size * 2;
+	// P5M: the target adapts to this network (see PushAudioFrame).
+	const size_t target_queue_size = size_t(audio_target_ms.load() * audio_out_rate / 1000.0) * audio_out_sample_size;
 
 	while(audio_out)
 	{
-		if(SDL_GetQueuedAudioSize(audio_out) > 3 * audio_buffer_size)
+		if(SDL_GetQueuedAudioSize(audio_out) > target_queue_size + 2 * audio_buffer_size)
 		{
 			CHIAKI_LOGW(log.GetChiakiLog(), "Audio queue exceeded latency threshold, clearing queued audio");
 			SDL_ClearQueuedAudio(audio_out);
@@ -2161,6 +2579,16 @@ void StreamSession::PushHapticsFrame(uint8_t *buf, size_t buf_size)
 		return;
 	}
 
+#ifdef Q_OS_MACOS
+	if(MacBluetoothHaptics *bt = bt_haptics_live.load(std::memory_order_acquire))
+	{
+		// The coil gets the track itself; no rumble envelope on top (the
+		// motors would drown it, and SDL rumble turns the coil's audio off).
+		if(ps5_rumble_intensity >= 0)
+			bt->Push(buf, buf_size / (2 * sizeof(int16_t)), rumble_multiplier * haptic_override);
+		return;
+	}
+#endif
 #if CHIAKI_GUI_ENABLE_STEAMDECK_NATIVE
 	if(sdeck && haptics_handheld > 0 && enable_steamdeck_haptics)
 	{
@@ -2330,6 +2758,10 @@ void StreamSession::Event(ChiakiEvent *event)
 	{
 		case CHIAKI_EVENT_CONNECTED:
 			connect_timer.invalidate();
+			learn_timer.start();
+			if(!learn_key.isEmpty())
+				CHIAKI_LOGI(log.GetChiakiLog(), "[learn] bitrate %u kbps (lost packets at %u, 0 = not yet), sound queue %.1f ms",
+					learn_used_kbps, learn_cap_kbps, audio_target_ms.load());
 			connected = true;
 			emit ConnectedChanged();
 			break;
@@ -2340,6 +2772,7 @@ void StreamSession::Event(ChiakiEvent *event)
 				return;
 			}
 			connected = false;
+			QMetaObject::invokeMethod(this, [this]() { LearnFromSession(); }, Qt::QueuedConnection);
 			emit ConnectedChanged();
 			emit SessionQuit(event->quit.reason, event->quit.reason_str ? QString::fromUtf8(event->quit.reason_str) : QString());
 			break;
@@ -2372,7 +2805,16 @@ void StreamSession::Event(ChiakiEvent *event)
 #endif
 						continue;
 					if(controller->IsDualSense() || controller->IsDualSenseEdge())
+					{
+#ifdef Q_OS_MACOS
+						// While the coil plays over Bluetooth, a non-zero SDL
+						// rumble would switch its audio haptics off.
+						if(MacBluetoothHaptics *bt = bt_haptics_live.load())
+							if(chiaki_time_now_monotonic_ms() - bt->LastSignalMs() < 1000)
+								continue;
+#endif
 						controller->SetRumble(left, right);
+					}
 					else
 						controller->SetRumble(left_adj, right_adj);
 				}
@@ -2777,7 +3219,12 @@ class StreamSessionPrivate
 	public:
 		static void InitAudio(StreamSession *session, uint32_t channels, uint32_t rate)
 		{
+#ifdef Q_OS_MACOS
+			// Chamadas de formato e PCM vêm do mesmo produtor; o encerramento o junta.
+			session->InitAudio(channels, rate);
+#else
 			QMetaObject::invokeMethod(session, "InitAudio", Qt::ConnectionType::BlockingQueuedConnection, Q_ARG(unsigned int, channels), Q_ARG(unsigned int, rate));
+#endif
 		}
 
 		static void InitMic(StreamSession *session, uint32_t channels, uint32_t rate)

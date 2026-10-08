@@ -3,14 +3,22 @@ import QtQuick.Layouts
 import QtQuick.Controls
 import QtQuick.Controls.Material
 
+import "p5m"
+
 Item {
     id: dialog
     property alias header: headerLabel.text
-    property alias title: titleLabel.text
+    property alias title: brand.screen
     property alias buttonText: okButton.text
     property alias buttonEnabled: okButton.enabled
     property alias buttonVisible: okButton.visible
     property Item restoreFocusItem
+    // Where focus lands when the dialog opens (default: first item).
+    property Item initialFocusItem: null
+    // Circle/Esc: return true when handled (e.g. leave a sub-page first).
+    property var backHandler: null
+    // Extra hints for the bottom bar, after Select / Back.
+    property var extraHints: []
     default property Item mainItem: null
 
     signal accepted()
@@ -20,7 +28,11 @@ Item {
         root.closeDialog();
     }
 
-    Keys.onEscapePressed: close()
+    Keys.onEscapePressed: {
+        if (backHandler && backHandler())
+            return;
+        close();
+    }
 
     Keys.onMenuPressed: {
         if (okButton.enabled)
@@ -32,7 +44,9 @@ Item {
     }
 
     StackView.onActivated: {
-        if (!restoreFocusItem) {
+        if (!restoreFocusItem && initialFocusItem) {
+            initialFocusItem.forceActiveFocus(Qt.TabFocusReason);
+        } else if (!restoreFocusItem) {
             let item = mainItem.nextItemInFocusChain();
             if (item)
                 item.forceActiveFocus(Qt.TabFocusReason);
@@ -49,27 +63,26 @@ Item {
         }
     }
 
-    ToolBar {
+    // P5M header: back, "P5M | Title", the confirm action on the right.
+    Item {
         id: toolBar
         anchors {
             top: parent.top
             left: parent.left
             right: parent.right
+            leftMargin: Theme.gutter
+            rightMargin: Theme.gutter
         }
         height: 80
 
         RowLayout {
-            anchors {
-                fill: parent
-                leftMargin: 10
-                rightMargin: 10
-            }
+            anchors.fill: parent
+            spacing: 16
 
             Button {
-                Layout.fillHeight: true
-                Layout.preferredWidth: 100
                 flat: true
                 text: "❮"
+                font.pixelSize: 26
                 focusPolicy: Qt.NoFocus
                 Material.roundedScale: Material.SmallScale
                 onClicked: {
@@ -78,54 +91,50 @@ Item {
                 }
             }
 
+            BrandHeader {
+                id: brand
+            }
+
             Item { Layout.fillWidth: true }
 
-            Button {
+            GlassButton {
                 id: okButton
-                Layout.fillHeight: true
-                flat: true
-                padding: 30
-                font.pixelSize: 25
                 focusPolicy: Qt.NoFocus
-                Material.roundedScale: Material.SmallScale
+                glyph: "OPTIONS"
+                // Lit when it can be used, so the confirm action stands out.
+                selected: enabled
                 onClicked: dialog.accepted()
-                icon.source: "qrc:/icons/options.svg";
-                icon.width: 50
-                icon.height: 50
             }
-        }
-
-        Label {
-            id: titleLabel
-            anchors.centerIn: parent
-            horizontalAlignment: Qt.AlignHCenter
-            verticalAlignment: Qt.AlignVCenter
-            font.bold: true
-            font.pixelSize: 26
-        }
-
-        Label {
-            id: headerLabel
-            anchors {
-                top: parent.top
-                left: titleLabel.right
-                right: parent.right
-                verticalCenter: parent.verticalCenter
-            }
-            horizontalAlignment: Qt.AlignHCenter
-            verticalAlignment: Qt.AlignVCenter
-            font.bold: true
-            font.pixelSize: 14
         }
     }
 
+    // Kept for the dialogs that set it: a short note under the header.
+    Text {
+        id: headerLabel
+        visible: false
+    }
     Item {
         id: contentItem
         anchors {
             top: toolBar.bottom
             left: parent.left
             right: parent.right
-            bottom: parent.bottom
+            bottom: hintBar.top
         }
+    }
+
+    HintBar {
+        id: hintBar
+        anchors {
+            left: parent.left
+            bottom: parent.bottom
+            leftMargin: Theme.gutter
+            bottomMargin: 14
+        }
+        hints: [
+            { button: "cross", key: "Return", text: qsTr("Select") },
+            { button: "circle", key: "Esc", text: qsTr("Back") },
+        ].concat(okButton.visible && okButton.text ? [{ button: "OPTIONS", key: "", text: okButton.text }] : [])
+         .concat(dialog.extraHints)
     }
 }

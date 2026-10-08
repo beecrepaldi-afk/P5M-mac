@@ -3,6 +3,7 @@ import QtQuick.Layouts
 import QtQuick.Controls
 import QtQuick.Controls.Material
 import "controls" as C
+import "p5m"
 
 Dialog {
     id: dialog
@@ -16,6 +17,16 @@ Dialog {
     y: Math.round((root.height - height) / 2)
     modal: true
     Material.roundedScale: Material.MediumScale
+    padding: 28
+    background: Rectangle {
+        radius: 30
+        border.width: 1
+        border.color: Qt.rgba(1, 1, 1, 60 / 255)
+        gradient: Gradient {
+            GradientStop { position: 0; color: Theme.panelTop }
+            GradientStop { position: 1; color: Theme.panelBottom }
+        }
+    }
     onOpened: label.forceActiveFocus(Qt.TabFocusReason)
     onAccepted: {
         newDialogOpen = true;
@@ -54,50 +65,36 @@ Dialog {
             Keys.onReturnPressed: dialog.accept()
         }
 
+        // Cross answers yes, Circle no (the label holds the focus).
         RowLayout {
             Layout.alignment: Qt.AlignCenter
-            spacing: 20
+            spacing: 16
 
-            Button {
+            PrimaryButton {
+                id: yesButton
                 text: qsTr("Yes")
-                Material.background: Material.accent
-                flat: true
-                leftPadding: 50
+                focusPolicy: Qt.NoFocus
+                font.pixelSize: Theme.itemSize
                 onClicked: dialog.accept()
-                Material.roundedScale: Material.SmallScale
-
-                Image {
-                    anchors {
-                        left: parent.left
-                        verticalCenter: parent.verticalCenter
-                        leftMargin: 12
+                contentItem: Row {
+                    spacing: 10
+                    Glyph { anchors.verticalCenter: parent.verticalCenter; button: "cross"; size: 22 }
+                    Text {
+                        anchors.verticalCenter: parent.verticalCenter
+                        text: qsTr("Yes")
+                        color: yesButton.hovered ? "#000000" : Theme.text
+                        font.pixelSize: Theme.itemSize
+                        font.weight: Font.Medium
                     }
-                    width: 28
-                    height: 28
-                    sourceSize: Qt.size(width, height)
-                    source: root.controllerButton("cross")
                 }
             }
 
-            Button {
-                Material.background: Material.accent
+            GlassButton {
                 text: qsTr("No")
-                flat: true
-                leftPadding: 50
+                glyph: "circle"
+                focusPolicy: Qt.NoFocus
+                implicitWidth: 160
                 onClicked: dialog.reject()
-                Material.roundedScale: Material.SmallScale
-
-                Image {
-                    anchors {
-                        left: parent.left
-                        verticalCenter: parent.verticalCenter
-                        leftMargin: 12
-                    }
-                    width: 28
-                    height: 28
-                    sourceSize: Qt.size(width, height)
-                    source: root.controllerButton("moon")
-                }
             }
         }
     }

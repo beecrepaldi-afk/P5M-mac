@@ -65,7 +65,25 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_ecdh_init(ChiakiECDH *ecdh)
 #undef CHECK
 #endif
 
+	ecdh->secret_size = CHIAKI_ECDH_SECRET_SIZE;
 	return CHIAKI_ERR_SUCCESS;
+}
+
+CHIAKI_EXPORT ChiakiErrorCode chiaki_ecdh_init_p521(ChiakiECDH *ecdh)
+{
+	memset(ecdh, 0, sizeof(ChiakiECDH));
+#ifdef CHIAKI_LIB_ENABLE_MBEDTLS
+	return CHIAKI_ERR_INVALID_DATA;
+#else
+#define CHECK(a) if(!(a)) { chiaki_ecdh_fini(ecdh); return CHIAKI_ERR_UNKNOWN; }
+	CHECK(ecdh->group = EC_GROUP_new_by_curve_name(NID_secp521r1));
+	CHECK(ecdh->key_local = EC_KEY_new());
+	CHECK(EC_KEY_set_group(ecdh->key_local, ecdh->group));
+	CHECK(EC_KEY_generate_key(ecdh->key_local));
+#undef CHECK
+	ecdh->secret_size = CHIAKI_ECDH_SECRET_SIZE_P521;
+	return CHIAKI_ERR_SUCCESS;
+#endif
 }
 
 CHIAKI_EXPORT void chiaki_ecdh_fini(ChiakiECDH *ecdh)
@@ -228,11 +246,11 @@ error:
 		return CHIAKI_ERR_UNKNOWN;
 	}
 
-	int r = ECDH_compute_key(secret_out, CHIAKI_ECDH_SECRET_SIZE, remote_public_key, ecdh->key_local, NULL);
+	int r = ECDH_compute_key(secret_out, ecdh->secret_size, remote_public_key, ecdh->key_local, NULL);
 
 	EC_POINT_free(remote_public_key);
 
-	if(r != CHIAKI_ECDH_SECRET_SIZE)
+	if(r != (int)ecdh->secret_size)
 		return CHIAKI_ERR_UNKNOWN;
 
 	return CHIAKI_ERR_SUCCESS;

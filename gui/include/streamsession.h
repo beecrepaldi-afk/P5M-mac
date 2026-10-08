@@ -40,8 +40,15 @@
 #include <QQueue>
 #include <QElapsedTimer>
 #include <QThread>
+#include <QPointer>
 #include <QWaitCondition>
 #include <QAtomicInteger>
+#include <atomic>
+#include <memory>
+#ifdef Q_OS_MACOS
+#include "macDualSenseBluetooth.h"
+#include "macAudioOutput.h"
+#endif
 #if CHIAKI_GUI_ENABLE_SPEEX
 #include <QQueue>
 #include <speex/speex_echo.h>
@@ -89,6 +96,8 @@ class SdeckHapticsWorker;
 		double packet_loss_max;
 		unsigned int audio_buffer_size;
 		int audio_volume;
+		bool mac_spatial_audio = true;
+		bool mac_head_tracking = false;
 		bool fullscreen;
 		bool zoom;
 		bool stretch;
@@ -98,6 +107,7 @@ class SdeckHapticsWorker;
 		bool enable_dualsense;
 		bool auto_regist;
 		float haptic_override;
+		int mac_bt_haptics;
 		ChiakiDisableAudioVideo audio_video_disabled;
 		RumbleHapticsIntensity rumble_haptics_intensity;
 		bool buttons_by_pos;
@@ -159,6 +169,7 @@ class StreamSession : public QObject
 	Q_PROPERTY(bool muted READ GetMuted WRITE SetMuted NOTIFY MutedChanged)
 	Q_PROPERTY(bool cantDisplay READ GetCantDisplay NOTIFY CantDisplayChanged)
 	Q_PROPERTY(int framesLost READ GetFramesLost NOTIFY FramesLostChanged)
+	Q_PROPERTY(QString audioOutputStatus READ GetAudioOutputStatus NOTIFY AudioOutputChanged)
 
 	private:
 		SessionLog log;
@@ -177,7 +188,7 @@ class StreamSession : public QObject
 		bool allow_unmute;
 		int input_block;
 		QString host;
-		int audio_volume;
+		std::atomic<int> audio_volume { SDL_MIX_MAXVOLUME };
 		double measured_bitrate = 0;
 		double average_packet_loss = 0;
 		int32_t frames_lost = 0;
@@ -253,7 +264,18 @@ class StreamSession : public QObject
 		QString audio_in_device_name;
 		SDL_AudioDeviceID audio_out;
 		SDL_AudioDeviceID audio_in;
-		size_t audio_out_sample_size;
+		size_t audio_out_sample_size = 0;
+		unsigned int audio_out_rate = 48000;
+		unsigned int audio_out_channels = 2;
+		QString audio_output_status = QStringLiteral("Waiting for the stream's audio format");
+		void SetAudioOutputStatus(const QString &status);
+#ifdef Q_OS_MACOS
+		std::unique_ptr<MacAudioOutput> mac_audio_output;
+		bool mac_spatial_audio = true;
+		bool mac_head_tracking = false;
+		uint64_t mac_audio_reopen_us = 0;
+		uint64_t mac_audio_last_underruns = 0;
+#endif
 		QMutex audio_out_ring_mutex;
 		QByteArray audio_out_ring_buf;
 		size_t audio_out_ring_read_pos = 0;
@@ -268,6 +290,10 @@ class StreamSession : public QObject
 		size_t haptics_buffer_size;
 		unsigned int audio_buffer_size;
 		ChiakiHolepunchSession holepunch_session;
+	public:
+		// Over the internet (PSN hole punching) rather than the home network.
+		bool IsRemote() const { return holepunch_session != nullptr; }
+	private:
 #if CHIAKI_GUI_ENABLE_SPEEX
 		SpeexEchoState *echo_state;
 		SpeexPreprocessState *preprocess_state;
@@ -279,6 +305,20 @@ class StreamSession : public QObject
 		QQueue<QByteArray> echo_to_cancel;
 #endif
 		SDL_AudioDeviceID haptics_output;
+		bool haptics_connecting = false;
+		QPointer<QThread> haptics_opener_thread;
+		QMutex haptics_opener_mutex;
+		SDL_AudioDeviceID haptics_opener_result = 0;
+		std::atomic<bool> shutting_down { false };
+#ifdef Q_OS_MACOS
+		// P5M: raw haptics to a DualSense over Bluetooth (no USB sound card).
+		// Set once on the GUI thread, read by the takion thread, destroyed
+		// only after the session threads are joined.
+		std::unique_ptr<MacBluetoothHaptics> bt_haptics;
+		std::atomic<MacBluetoothHaptics *> bt_haptics_live { nullptr };
+		int mac_bt_haptics = 0;
+		void StartBluetoothHaptics();
+#endif
 		SDL_AudioCVT haptics_cvt;
 		uint8_t *haptics_resampler_buf;
 		MicBuf mic_buf;
@@ -292,6 +332,26 @@ class StreamSession : public QObject
 		QAtomicInteger<bool> mic_active = true;
 		QMap<Qt::Key, int> key_map;
 		QElapsedTimer connect_timer;
+		// P5M learning per network (see LearnFromSession): the sound queue
+		// adapts live, the bitrate between sessions.
+		std::atomic<double> audio_target_ms { 20 };
+		uint64_t audio_window_start_us = 0;
+		uint64_t audio_queued_sum_us = 0;
+		uint64_t audio_queued_max_us = 0;
+		uint64_t audio_queued_min_us = ~uint64_t(0);
+		uint64_t audio_last_raise_us = 0;
+		uint64_t audio_first_frame_us = 0;
+		uint64_t audio_last_frame_us = 0;
+		unsigned audio_window_frames = 0;
+		unsigned audio_window_dry = 0;
+		unsigned audio_clean_windows = 0;
+		unsigned audio_pcm_peak = 0;
+		uint64_t audio_full_scale_samples = 0, audio_measured_samples = 0;
+		QString learn_key;
+		unsigned learn_cap_kbps = 0, learn_used_kbps = 0;
+		QElapsedTimer learn_timer;
+		bool learn_saved = false;
+		void LearnFromSession();
 
 		void StartAudioOutDrainThread();
 		void StopAudioOutDrainThread();
@@ -350,7 +410,8 @@ class StreamSession : public QObject
 		int GetFramesLost()		{ return frames_lost; }
 		bool GetMuted()	{ return muted; }
 		void SetMuted(bool enable)	{ if (enable != muted) ToggleMute(); }
-		void SetAudioVolume(int volume) { audio_volume = volume; }
+		QString GetAudioOutputStatus() const { return audio_output_status; }
+		void SetAudioVolume(int volume) { audio_volume.store(qBound(0, volume, SDL_MIX_MAXVOLUME), std::memory_order_relaxed); }
 		bool GetCantDisplay()	{ return cant_display; }
 		ChiakiErrorCode ConnectPsnConnection(QString duid, bool ps5);
 		void CancelPsnConnection(bool stop_thread);
@@ -392,6 +453,7 @@ class StreamSession : public QObject
 		void MeasuredBitrateChanged();
 		void AveragePacketLossChanged();
 		void FramesLostChanged();
+		void AudioOutputChanged();
 		void MutedChanged();
 		void CantDisplayChanged(bool cant_display);
 		void FecFailure();
@@ -400,6 +462,7 @@ class StreamSession : public QObject
 		void UpdateGamepads();
 		void DpadSendFeedbackState();
 		void SendFeedbackState();
+		// TEMP diagnostic: buttons that went to the console, by source.
 };
 
 Q_DECLARE_METATYPE(ChiakiQuitReason)

@@ -30,9 +30,22 @@
 	<string>${MACOSX_BUNDLE_COPYRIGHT}</string>
 	<key>NSHighResolutionCapable</key>
 	<true/>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>P5M finds, wakes and streams from your PlayStation on your local network.</string>
 	<key>NSMicrophoneUsageDescription</key>
-	<string>For mic support, chiaki-ng requires access to your microphone.</string>
+	<string>P5M uses your microphone only when you unmute it during Remote Play.</string>
 	<key>LSApplicationCategoryType</key>
 	<string>public.app-category.games</string>
+	<key>LSSupportsGameMode</key>
+	<true/>
+	<key>GCSupportsControllerUserInteraction</key>
+	<true/>
+	<key>GCSupportedGameControllers</key>
+	<array>
+		<dict>
+			<key>ProfileName</key>
+			<string>ExtendedGamepad</string>
+		</dict>
+	</array>
 </dict>
 </plist>

@@ -10,8 +10,70 @@
 #include <chiaki/video.h>
 
 #include <string.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <inttypes.h>
 #include <assert.h>
+#include <chiaki/time.h>
+
+/*
+ * P5M: o bitrate de verdade, no diario, a cada dez segundos.
+ *
+ * O console manda de tempos em tempos um relatorio de qualidade da conexao
+ * com o bitrate que o codificador dele esta mirando, e o chiaki calcula o que
+ * chegou; os dois so saiam no nivel verbose, desligado. Sem eles nao havia
+ * como saber se um teto acima de 50 Mbps e aceito pelo console, nem quanto
+ * ele de fato usa (dev.212). O maximo da sessao vai junto em cada linha,
+ * porque a pergunta e "passou dos 50?" e a resposta tem de sobreviver a uma
+ * janela calma no fim.
+ *
+ * Estaticas porque ha uma sessao por processo; zeradas quando a janela nasce
+ * de uma sessao nova (stream_connection diferente).
+ */
+static void p5m_bitrate_janela(ChiakiStreamConnection *sc, int32_t alvo, double rtt, long long perda)
+{
+	static ChiakiStreamConnection *dono = NULL;
+	static uint64_t inicio_ms = 0;
+	static unsigned relatos = 0;
+	static int32_t alvo_min = 0, alvo_max = 0, alvo_ultimo = 0, alvo_sessao = 0;
+	static double medido_soma = 0.0, medido_max = 0.0, medido_sessao = 0.0, rtt_max = 0.0;
+	static long long perda_max = 0;
+	uint64_t agora = chiaki_time_now_monotonic_ms();
+	if(dono != sc)
+	{
+		dono = sc;
+		inicio_ms = agora;
+		relatos = 0;
+		alvo_sessao = 0;
+		medido_sessao = 0.0;
+		alvo_min = alvo_max = 0;
+		medido_soma = medido_max = rtt_max = 0.0;
+		perda_max = 0;
+	}
+	double medido = sc->measured_bitrate;
+	if(relatos == 0 || alvo < alvo_min) alvo_min = alvo;
+	if(relatos == 0 || alvo > alvo_max) alvo_max = alvo;
+	if(alvo > alvo_sessao) alvo_sessao = alvo;
+	if(medido > medido_max) medido_max = medido;
+	if(medido > medido_sessao) medido_sessao = medido;
+	if(rtt > rtt_max) rtt_max = rtt;
+	if(perda > perda_max) perda_max = perda;
+	alvo_ultimo = alvo;
+	medido_soma += medido;
+	relatos++;
+	if(agora - inicio_ms < 10000)
+		return;
+	CHIAKI_LOGE(sc->log, "P5M: bitrate 10s: asked %u kbps; console target %d..%d (last %d, session max %d); "
+			"received %.1f Mbps avg, %.1f max (session max %.1f); %u reports, rtt max %.4f, loss max %lld",
+			(unsigned)sc->session->connect_info.video_profile.bitrate,
+			alvo_min, alvo_max, alvo_ultimo, alvo_sessao,
+			medido_soma / relatos, medido_max, medido_sessao, relatos, rtt_max, perda_max);
+	inicio_ms = agora;
+	relatos = 0;
+	alvo_min = alvo_max = 0;
+	medido_soma = medido_max = rtt_max = 0.0;
+	perda_max = 0;
+}
 #ifndef _WIN32
 #include <unistd.h>
 #include <sys/types.h>
@@ -31,6 +93,8 @@
 #define STREAM_CONNECTION_PORT 9296
 
 #define EXPECT_TIMEOUT_MS 5000
+// P5M: the console answers the Takion version request in ~2 ms; without an answer, go on with 12 quickly.
+#define P5M_VERSION_TIMEOUT_MS 1000
 
 #define HEARTBEAT_INTERVAL_MS 1000
 
@@ -39,7 +103,8 @@ typedef enum {
 	STATE_IDLE,
 	STATE_TAKION_CONNECT,
 	STATE_EXPECT_BANG,
-	STATE_EXPECT_STREAMINFO
+	STATE_EXPECT_STREAMINFO,
+	STATE_EXPECT_PROTOCOL_ACK // only used by the P5M_TAKION_PROBE diagnostic
 } StreamConnectionState;
 
 void chiaki_session_send_event(ChiakiSession *session, ChiakiEvent *event);
@@ -68,6 +133,8 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_stream_connection_init(ChiakiStreamConnecti
 	stream_connection->packet_loss_max = packet_loss_max;
 
 	stream_connection->ecdh_secret = NULL;
+	stream_connection->ecdh_secret_size = 0;
+	stream_connection->ecdh_p521_active = false;
 	stream_connection->gkcrypt_remote = NULL;
 	stream_connection->gkcrypt_local = NULL;
 	stream_connection->streaminfo_early_buf = NULL;
@@ -125,6 +192,8 @@ CHIAKI_EXPORT void chiaki_stream_connection_fini(ChiakiStreamConnection *stream_
 	chiaki_gkcrypt_free(stream_connection->gkcrypt_local);
 
 	free(stream_connection->ecdh_secret);
+	if(stream_connection->ecdh_p521_active)
+		chiaki_ecdh_fini(&stream_connection->ecdh_p521);
 	if (stream_connection->congestion_control.thread.thread)
 		chiaki_congestion_control_stop(&stream_connection->congestion_control);
 
@@ -140,6 +209,183 @@ static bool state_finished_cond_check(void *user)
 {
 	ChiakiStreamConnection *stream_connection = user;
 	return stream_connection->state_finished || stream_connection->should_stop || stream_connection->remote_disconnected;
+}
+
+/*
+ * P5M: sonda da versao do Takion (diagnostico, desligada por padrao).
+ *
+ * O app oficial pede ao console, antes do BIG, a lista de versoes do Takion
+ * que sabe falar e usa a que vier no ack; o chiaki manda o BIG direto com a
+ * 12. Com P5M_TAKION_PROBE=1 (ou "a-b" para outra faixa) a sessao faz so
+ * esse pedido, anota a resposta no diario e sai sem stream, porque os
+ * cabecalhos das versoes novas ainda nao sao entendidos aqui.
+ */
+static bool p5m_takion_probe_range(int *lo, int *hi)
+{
+	const char *env = getenv("P5M_TAKION_PROBE");
+	if(!env || !*env || strcmp(env, "0") == 0)
+		return false;
+	int a = 12, b = 20;
+	if(sscanf(env, "%d-%d", &a, &b) != 2 || a < 1 || b < a || b - a >= 32)
+	{
+		a = 12;
+		b = 20;
+	}
+	if(lo)
+		*lo = a;
+	if(hi)
+		*hi = b;
+	return true;
+}
+
+typedef struct
+{
+	int32_t items[32];
+	int num;
+} P5MTakionVersions;
+
+static bool p5m_encode_takion_versions(pb_ostream_t *ostream, const pb_field_t *field, void *const *arg)
+{
+	const P5MTakionVersions *versions = *arg;
+	for(int i = 0; i < versions->num; i++)
+		if(!pb_encode_tag_for_field(ostream, field) || !pb_encode_varint(ostream, versions->items[i]))
+			return false;
+	return true;
+}
+
+static struct
+{
+	bool got_ack;
+	bool has_version;
+	uint32_t version;
+	int other_msgs;
+	int last_other_type;
+} p5m_probe;
+
+// Called with state_mutex held, from the takion thread.
+static void p5m_takion_probe_data(ChiakiStreamConnection *stream_connection, uint8_t *buf, size_t buf_size)
+{
+	tkproto_TakionMessage msg;
+	memset(&msg, 0, sizeof(msg));
+	pb_istream_t stream = pb_istream_from_buffer(buf, buf_size);
+	if(!pb_decode(&stream, tkproto_TakionMessage_fields, &msg))
+	{
+		CHIAKI_LOGE(stream_connection->log, "[takion-probe] could not decode a message (%zu bytes)", buf_size);
+		return;
+	}
+	if(msg.type == tkproto_TakionMessage_PayloadType_TAKIONPROTOCOLREQUESTACK)
+	{
+		p5m_probe.got_ack = true;
+		p5m_probe.has_version = msg.has_takion_protocol_request_ack && msg.takion_protocol_request_ack.has_takion_protocol_version;
+		p5m_probe.version = msg.takion_protocol_request_ack.takion_protocol_version;
+		stream_connection->state_finished = true;
+		chiaki_cond_signal(&stream_connection->state_cond);
+		return;
+	}
+	p5m_probe.other_msgs++;
+	p5m_probe.last_other_type = msg.type;
+	if(msg.type == tkproto_TakionMessage_PayloadType_DISCONNECT)
+	{
+		stream_connection->state_finished = true;
+		chiaki_cond_signal(&stream_connection->state_cond);
+	}
+}
+
+/*
+ * Called with state_mutex held, after the takion connect and before the BIG.
+ * Asks for the given versions; returns the one the console chose, 0 without an answer.
+ */
+static uint32_t p5m_takion_request_versions(ChiakiStreamConnection *stream_connection, const P5MTakionVersions *versions)
+{
+	int lo = versions->items[0], hi = versions->items[versions->num - 1];
+	memset(&p5m_probe, 0, sizeof(p5m_probe));
+
+	tkproto_TakionMessage msg;
+	memset(&msg, 0, sizeof(msg));
+	msg.type = tkproto_TakionMessage_PayloadType_TAKIONPROTOCOLREQUEST;
+	msg.has_takion_protocol_request = true;
+	msg.takion_protocol_request.supported_takion_versions.arg = (void *)versions;
+	msg.takion_protocol_request.supported_takion_versions.funcs.encode = p5m_encode_takion_versions;
+
+	uint8_t buf[160];
+	pb_ostream_t stream = pb_ostream_from_buffer(buf, sizeof(buf));
+	if(!pb_encode(&stream, tkproto_TakionMessage_fields, &msg))
+	{
+		CHIAKI_LOGE(stream_connection->log, "[takion-probe] request encoding failed");
+		return 0;
+	}
+
+	stream_connection->state = STATE_EXPECT_PROTOCOL_ACK;
+	stream_connection->state_finished = false;
+	stream_connection->state_failed = false;
+	CHIAKI_LOGI(stream_connection->log, "[takion-probe] asking the console for Takion versions %d..%d (connected as %u)",
+			lo, hi, (unsigned)stream_connection->takion.version);
+	ChiakiErrorCode err = chiaki_takion_send_message_data(&stream_connection->takion, 1, 1, buf, stream.bytes_written, NULL);
+	if(err != CHIAKI_ERR_SUCCESS)
+	{
+		CHIAKI_LOGE(stream_connection->log, "[takion-probe] sending the request failed: %s", chiaki_error_string(err));
+		return 0;
+	}
+	chiaki_cond_timedwait_pred(&stream_connection->state_cond, &stream_connection->state_mutex, P5M_VERSION_TIMEOUT_MS, state_finished_cond_check, stream_connection);
+
+	if(p5m_probe.got_ack && p5m_probe.has_version)
+		CHIAKI_LOGI(stream_connection->log, "[takion-probe] console chose Takion version %u", (unsigned)p5m_probe.version);
+	else if(p5m_probe.got_ack)
+		CHIAKI_LOGE(stream_connection->log, "[takion-probe] console answered without a version");
+	else
+		CHIAKI_LOGE(stream_connection->log, "[takion-probe] no answer in %d ms (%d other messages, last type %d, remote disconnected %d)",
+				P5M_VERSION_TIMEOUT_MS, p5m_probe.other_msgs, p5m_probe.last_other_type, stream_connection->remote_disconnected ? 1 : 0);
+	return p5m_probe.got_ack && p5m_probe.has_version ? p5m_probe.version : 0;
+}
+
+// P5M_TAKION_PROBE: ask for a range, log the answer, leave without streaming.
+static void p5m_takion_probe_run(ChiakiStreamConnection *stream_connection)
+{
+	int lo = 12, hi = 20;
+	p5m_takion_probe_range(&lo, &hi);
+	P5MTakionVersions versions = { .num = 0 };
+	for(int v = lo; v <= hi; v++)
+		versions.items[versions.num++] = v;
+	p5m_takion_request_versions(stream_connection, &versions);
+	CHIAKI_LOGE(stream_connection->log, "[takion-probe] done, leaving the session without streaming");
+}
+
+/*
+ * P5M: Takion v20, on by default since 08/10/2026 (P5M_TAKION_V20=0 goes back to 12).
+ *
+ * The official app negotiates the version on the stream connection before
+ * the BIG; the console answers 20 when offered. This build speaks 12 and 20
+ * (see mac/TAKION-V20.md), so it offers just those two and switches if the
+ * console picks 20. Without an answer the stream goes on with 12, as before.
+ */
+static bool p5m_takion_v20_wanted(void)
+{
+	const char *env = getenv("P5M_TAKION_V20");
+	return !env || strcmp(env, "0") != 0;
+}
+
+// Called with state_mutex held, after the takion connect and before the BIG.
+static void p5m_takion_v20_negotiate(ChiakiStreamConnection *stream_connection)
+{
+	P5MTakionVersions versions = { .items = { 12, 20 }, .num = 2 };
+	uint32_t chosen = p5m_takion_request_versions(stream_connection, &versions);
+	stream_connection->state_finished = false;
+	stream_connection->state_failed = false;
+	if(chosen != 20)
+	{
+		CHIAKI_LOGE(stream_connection->log, "[takion-v20] console chose %u, staying on %u", (unsigned)chosen, (unsigned)stream_connection->takion.version);
+		return;
+	}
+	// From Takion 13 on, the BIG/BANG key exchange runs on secp521r1.
+	if(!stream_connection->ecdh_p521_active)
+	{
+		if(chiaki_ecdh_init_p521(&stream_connection->ecdh_p521) != CHIAKI_ERR_SUCCESS)
+			CHIAKI_LOGE(stream_connection->log, "[takion-v20] failed to create the secp521r1 key, the BANG will fail");
+		else
+			stream_connection->ecdh_p521_active = true;
+	}
+	if(chiaki_takion_set_version(&stream_connection->takion, 20) == CHIAKI_ERR_SUCCESS)
+		CHIAKI_LOGI(stream_connection->log, "[takion-v20] streaming with Takion version 20 (key exchange on secp521r1)");
 }
 
 CHIAKI_EXPORT ChiakiErrorCode chiaki_stream_connection_run(ChiakiStreamConnection *stream_connection, chiaki_socket_t *socket)
@@ -234,6 +480,17 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_stream_connection_run(ChiakiStreamConnectio
 		CHIAKI_LOGE(session->log, "StreamConnection Takion connect failed");
 		goto err_congestion_control;
 	}
+
+	if(p5m_takion_probe_range(NULL, NULL))
+	{
+		// Diagnostic only: ask which Takion versions the console accepts, then leave without streaming.
+		p5m_takion_probe_run(stream_connection);
+		err = CHIAKI_ERR_CANCELED;
+		goto disconnect;
+	}
+
+	if(chiaki_target_is_ps5(session->target) && p5m_takion_v20_wanted())
+		p5m_takion_v20_negotiate(stream_connection);
 
 	CHIAKI_LOGI(session->log, "StreamConnection sending big");
 
@@ -453,6 +710,9 @@ static void stream_connection_takion_data_protobuf(ChiakiStreamConnection *strea
 		case STATE_EXPECT_STREAMINFO:
 			stream_connection_takion_data_expect_streaminfo(stream_connection, buf, buf_size);
 			break;
+		case STATE_EXPECT_PROTOCOL_ACK:
+			p5m_takion_probe_data(stream_connection, buf, buf_size);
+			break;
 		default: // STATE_IDLE
 			stream_connection_takion_data_idle(stream_connection, buf, buf_size);
 			break;
@@ -479,6 +739,13 @@ static void stream_connection_takion_data_rumble(ChiakiStreamConnection *stream_
 
 static void stream_connection_takion_data_trigger_effects(ChiakiStreamConnection *stream_connection, uint8_t *buf, size_t buf_size)
 {
+	// P5M: on Takion 20 the trigger message carries 8 extra bytes in front
+	// (the extended header); the 25 bytes after them are the v12 layout.
+	if(stream_connection->takion.version >= 20 && buf_size >= 33)
+	{
+		buf += 8;
+		buf_size -= 8;
+	}
 	if(buf_size < 25)
 	{
 		CHIAKI_LOGE(stream_connection->log, "StreamConnection got trigger effects packet with size %#llx < 25",
@@ -528,6 +795,7 @@ static void stream_connection_takion_data_pad_info(ChiakiStreamConnection *strea
 
 	switch(buf_size)
 	{
+		case 0x1a: // Takion v20 appends one byte
 		case 0x19:
 		{
 			// sequence number of feedback packet this is responding to
@@ -561,6 +829,7 @@ static void stream_connection_takion_data_pad_info(ChiakiStreamConnection *strea
 			}
 			break;
 		}
+		case 0x12: // Takion v20 appends one byte
 		case 0x11:
 		{
 			if(stream_connection->haptic_intensity != buf[12])
@@ -703,6 +972,7 @@ static void stream_connection_takion_data_idle(ChiakiStreamConnection *stream_co
 			 q.disable_upstream_audio, q.rtt, q.loss);
 		stream_connection->measured_bitrate = chiaki_stream_stats_bitrate(&stream_connection->video_receiver->frame_processor.stream_stats, stream_connection->session->connect_info.video_profile.max_fps) / 1000000.0;
 		CHIAKI_LOGV(stream_connection->log, "StreamConnection measured bitrate: %.4f MBit/s", stream_connection->measured_bitrate);
+		p5m_bitrate_janela(stream_connection, q.target_bitrate, q.rtt, q.loss);
 		chiaki_stream_stats_reset(&stream_connection->video_receiver->frame_processor.stream_stats);
 		break;
 	}
@@ -718,17 +988,22 @@ static void stream_connection_takion_data_idle(ChiakiStreamConnection *stream_co
 	}
 }
 
+static ChiakiECDH *stream_connection_ecdh(ChiakiStreamConnection *stream_connection)
+{
+	return stream_connection->ecdh_p521_active ? &stream_connection->ecdh_p521 : &stream_connection->session->ecdh;
+}
+
 static ChiakiErrorCode stream_connection_init_crypt(ChiakiStreamConnection *stream_connection)
 {
 	ChiakiSession *session = stream_connection->session;
 
-	stream_connection->gkcrypt_local = chiaki_gkcrypt_new(stream_connection->log, CHIAKI_GKCRYPT_KEY_BUF_BLOCKS_DEFAULT, 2, session->handshake_key, stream_connection->ecdh_secret);
+	stream_connection->gkcrypt_local = chiaki_gkcrypt_new_secret(stream_connection->log, CHIAKI_GKCRYPT_KEY_BUF_BLOCKS_DEFAULT, 2, session->handshake_key, stream_connection->ecdh_secret, stream_connection->ecdh_secret_size);
 	if(!stream_connection->gkcrypt_local)
 	{
 		CHIAKI_LOGE(stream_connection->log, "StreamConnection failed to initialize local GKCrypt with index 2");
 		return CHIAKI_ERR_UNKNOWN;
 	}
-	stream_connection->gkcrypt_remote = chiaki_gkcrypt_new(stream_connection->log, CHIAKI_GKCRYPT_KEY_BUF_BLOCKS_DEFAULT, 3, session->handshake_key, stream_connection->ecdh_secret);
+	stream_connection->gkcrypt_remote = chiaki_gkcrypt_new_secret(stream_connection->log, CHIAKI_GKCRYPT_KEY_BUF_BLOCKS_DEFAULT, 3, session->handshake_key, stream_connection->ecdh_secret, stream_connection->ecdh_secret_size);
 	if(!stream_connection->gkcrypt_remote)
 	{
 		CHIAKI_LOGE(stream_connection->log, "StreamConnection failed to initialize remote GKCrypt with index 3");
@@ -744,7 +1019,7 @@ static ChiakiErrorCode stream_connection_init_crypt(ChiakiStreamConnection *stre
 
 static void stream_connection_takion_data_expect_bang(ChiakiStreamConnection *stream_connection, uint8_t *buf, size_t buf_size)
 {
-	char ecdh_pub_key[128];
+	char ecdh_pub_key[160]; // 133 bytes on secp521r1
 	ChiakiPBDecodeBuf ecdh_pub_key_buf = { sizeof(ecdh_pub_key), 0, (uint8_t *)ecdh_pub_key };
 	char ecdh_sig[32];
 	ChiakiPBDecodeBuf ecdh_sig_buf = { sizeof(ecdh_sig), 0, (uint8_t *)ecdh_sig };
@@ -761,7 +1036,8 @@ static void stream_connection_takion_data_expect_bang(ChiakiStreamConnection *st
 	bool r = pb_decode(&stream, tkproto_TakionMessage_fields, &msg);
 	if(!r)
 	{
-		CHIAKI_LOGE(stream_connection->log, "StreamConnection failed to decode data protobuf");
+		CHIAKI_LOGE(stream_connection->log, "StreamConnection failed to decode data protobuf (%s)", PB_GET_ERROR(&stream));
+		chiaki_log_hexdump(stream_connection->log, CHIAKI_LOG_ERROR, buf, buf_size);
 		return;
 	}
 
@@ -816,14 +1092,16 @@ static void stream_connection_takion_data_expect_bang(ChiakiStreamConnection *st
 	}
 
 	assert(!stream_connection->ecdh_secret);
-	stream_connection->ecdh_secret = malloc(CHIAKI_ECDH_SECRET_SIZE);
+	ChiakiECDH *ecdh = stream_connection_ecdh(stream_connection);
+	stream_connection->ecdh_secret_size = ecdh->secret_size;
+	stream_connection->ecdh_secret = malloc(CHIAKI_ECDH_SECRET_SIZE_MAX);
 	if(!stream_connection->ecdh_secret)
 	{
 		CHIAKI_LOGE(stream_connection->log, "StreamConnection failed to alloc ECDH secret memory");
 		goto error;
 	}
 
-	ChiakiErrorCode err = chiaki_ecdh_derive_secret(&stream_connection->session->ecdh,
+	ChiakiErrorCode err = chiaki_ecdh_derive_secret(ecdh,
 			stream_connection->ecdh_secret,
 			ecdh_pub_key_buf.buf, ecdh_pub_key_buf.size,
 			stream_connection->session->handshake_key,
@@ -1041,11 +1319,11 @@ static ChiakiErrorCode stream_connection_send_big(ChiakiStreamConnection *stream
 		return err;
 	}
 
-	uint8_t ecdh_pub_key[128];
+	uint8_t ecdh_pub_key[160]; // 133 bytes on secp521r1
 	ChiakiPBBuf ecdh_pub_key_buf = { sizeof(ecdh_pub_key), ecdh_pub_key };
 	uint8_t ecdh_sig[32];
 	ChiakiPBBuf ecdh_sig_buf = { sizeof(ecdh_sig), ecdh_sig };
-	err = chiaki_ecdh_get_local_pub_key(&session->ecdh,
+	err = chiaki_ecdh_get_local_pub_key(stream_connection_ecdh(stream_connection),
 			ecdh_pub_key, &ecdh_pub_key_buf.size,
 			session->handshake_key,
 			ecdh_sig, &ecdh_sig_buf.size);

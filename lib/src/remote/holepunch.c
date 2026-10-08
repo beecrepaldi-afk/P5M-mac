@@ -339,6 +339,8 @@ typedef struct session_t
     UPNPGatewayStatus gw_status;
     ChiakiThread upnp_thread;
     bool upnp_thread_running;
+    bool upnp_thread_created; // Uma thread terminada ainda precisa de join.
+    uint64_t upnp_deadline_ms; // P5M: discovery runs alongside the session setup
 
     uint8_t data1[16];
     uint8_t data2[16];
@@ -416,6 +418,7 @@ static bool upnp_add_udp_port_mapping(ChiakiLog *log, UPNPGatewayInfo *gw_info, 
 static bool upnp_delete_udp_port_mapping(ChiakiLog *log, UPNPGatewayInfo *gw_info, uint16_t port_external);
 static bool get_client_addr_remote_stun(Session *session, char *address, uint16_t *port, chiaki_socket_t *sock, bool ipv4);
 static ChiakiErrorCode get_stun_servers(Session *session);
+static void prefer_reliable_stun_servers(Session *session);
 // static bool get_mac_addr(ChiakiLog *log, uint8_t *mac_addr);
 static void log_session_state(Session *session);
 static ChiakiErrorCode decode_customdata1(ChiakiLog *log, const char *customdata1, uint8_t *out, size_t out_len);
@@ -525,7 +528,7 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_holepunch_list_devices(
             long http_code = 0;
             curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
             CHIAKI_LOGE(log, "chiaki_holepunch_list_devices: Fetching device list from %s failed with HTTP code %ld", url, http_code);
-            CHIAKI_LOGV(log, "Response Body: %.*s.", (int)response_data.size, response_data.data);
+            CHIAKI_LOGV(log, "PSN payload omitted for privacy");
             err = CHIAKI_ERR_HTTP_NONOK;
         } else {
             CHIAKI_LOGE(log, "chiaki_holepunch_list_devices: Fetching device list from %s failed with CURL error %s", url, curl_easy_strerror(res));
@@ -569,8 +572,7 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_holepunch_list_devices(
         goto cleanup_json;
     }
     CHIAKI_LOGV(log, console_type == CHIAKI_HOLEPUNCH_CONSOLE_TYPE_PS5 ? "PS5 devices: ": "PS4 devices: ");
-    const char *json_str = json_object_to_json_string_ext(clients, JSON_C_TO_STRING_PRETTY);
-    CHIAKI_LOGV(log, "chiaki_holepunch_list_devices: retrieved devices \n%s", json_str);
+    CHIAKI_LOGV(log, "PSN payload omitted for privacy");
     size_t num_clients = json_object_array_length(clients);
     *devices = malloc(sizeof(ChiakiHolepunchDeviceInfo) * num_clients);
     if(!(*devices))
@@ -791,8 +793,11 @@ CHIAKI_EXPORT Session* chiaki_holepunch_session_init(
     session->num_stun_servers = 0;
     session->num_stun_servers_ipv6 = 0;
     session->gw.data = NULL;
+    session->gw.urls = NULL;
     session->gw_status = GATEWAY_STATUS_UNKNOWN;
     session->upnp_thread_running = false;
+    session->upnp_thread_created = false;
+    session->upnp_deadline_ms = 0;
 
     ChiakiErrorCode err;
     err = chiaki_mutex_init(&session->notif_mutex, false);
@@ -832,7 +837,9 @@ CHIAKI_EXPORT Session* chiaki_holepunch_session_init(
     return session;
 }
 
-#define UPNP_DISCOVER_TIMEOUT_MS 7000
+// P5M: a router with UPnP answers in well under a second; hotel and mobile
+// networks have none, and waiting 7 s for that delayed every connection.
+#define UPNP_DISCOVER_TIMEOUT_MS 2500
 
 static void *upnp_discover_thread_func(void *arg)
 {
@@ -858,6 +865,8 @@ static void *upnp_discover_thread_func(void *arg)
 
 CHIAKI_EXPORT ChiakiErrorCode chiaki_holepunch_upnp_discover(Session *session)
 {
+    if(session->upnp_thread_created)
+        return CHIAKI_ERR_SUCCESS;
     session->gw.data = calloc(1, sizeof(struct IGDdatas));
     if(!session->gw.data)
     {
@@ -867,10 +876,14 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_holepunch_upnp_discover(Session *session)
     if(!session->gw.urls)
     {
         free(session->gw.data);
+        session->gw.data = NULL;
         return CHIAKI_ERR_MEMORY;
     }
 
+    chiaki_mutex_lock(&session->state_mutex);
     session->upnp_thread_running = true;
+    session->upnp_deadline_ms = chiaki_time_now_monotonic_ms() + UPNP_DISCOVER_TIMEOUT_MS;
+    chiaki_mutex_unlock(&session->state_mutex);
     ChiakiErrorCode err = chiaki_thread_create(&session->upnp_thread, upnp_discover_thread_func, session);
     if(err != CHIAKI_ERR_SUCCESS)
     {
@@ -890,25 +903,33 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_holepunch_upnp_discover(Session *session)
         return CHIAKI_ERR_SUCCESS;
     }
 
+    // P5M: don't block here. Away from home there is usually no UPnP
+    // router and this waited the full 7 s before the PSN connection even
+    // started; now the discovery runs while the websocket and the session
+    // are set up, and the offer waits only for what is left of the timeout
+    // (upnp_wait_result).
+    session->upnp_thread_created = true;
+    return CHIAKI_ERR_SUCCESS;
+}
+
+// Gateway status for the offer: waits for a running discovery, until its
+// deadline at most.
+static UPNPGatewayStatus upnp_wait_result(Session *session)
+{
     chiaki_mutex_lock(&session->state_mutex);
     while(session->upnp_thread_running)
     {
-        err = chiaki_cond_timedwait(&session->state_cond, &session->state_mutex, UPNP_DISCOVER_TIMEOUT_MS);
-        if(err == CHIAKI_ERR_TIMEOUT)
+        const uint64_t now = chiaki_time_now_monotonic_ms();
+        if(now >= session->upnp_deadline_ms)
             break;
+        chiaki_cond_timedwait(&session->state_cond, &session->state_mutex, session->upnp_deadline_ms - now);
     }
-
-    if(session->upnp_thread_running)
-    {
-        chiaki_mutex_unlock(&session->state_mutex);
-        CHIAKI_LOGW(session->log, "UPnP discovery timed out after %d ms, skipping", UPNP_DISCOVER_TIMEOUT_MS);
-        session->gw_status = GATEWAY_STATUS_NOT_FOUND;
-        return CHIAKI_ERR_SUCCESS;
-    }
+    const bool still_running = session->upnp_thread_running;
+    const UPNPGatewayStatus status = still_running ? GATEWAY_STATUS_NOT_FOUND : session->gw_status;
     chiaki_mutex_unlock(&session->state_mutex);
-
-    chiaki_thread_join(&session->upnp_thread, NULL);
-    return CHIAKI_ERR_SUCCESS;
+    if(still_running)
+        CHIAKI_LOGW(session->log, "UPnP discovery timed out after %d ms, skipping", UPNP_DISCOVER_TIMEOUT_MS);
+    return status;
 }
 
 CHIAKI_EXPORT ChiakiErrorCode chiaki_holepunch_session_create(Session* session)
@@ -925,7 +946,27 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_holepunch_session_create(Session* session)
     }
     else
     {
-        err = get_websocket_fqdn(session, &session->ws_fqdn);
+        // P5M: right after the Mac wakes up the network is not ready for a
+        // few seconds and this first request failed the whole connection.
+        // Nothing is set up yet here, so trying again is safe.
+        for(int attempt = 1; ; attempt++)
+        {
+            err = get_websocket_fqdn(session, &session->ws_fqdn);
+            if (err == CHIAKI_ERR_SUCCESS || err == CHIAKI_ERR_MEMORY || attempt >= 5)
+                break;
+            chiaki_mutex_lock(&session->stop_mutex);
+            const bool stop = session->main_should_stop;
+            chiaki_mutex_unlock(&session->stop_mutex);
+            if(stop)
+                break;
+            CHIAKI_LOGW(session->log, "chiaki_holepunch_session_create: PSN not reachable yet (%s), trying again (%d/4)",
+                chiaki_error_string(err), attempt);
+#ifdef _WIN32
+            Sleep(1500);
+#else
+            usleep(1500 * 1000);
+#endif
+        }
         if (err != CHIAKI_ERR_SUCCESS)
             return err;
     }
@@ -1045,8 +1086,7 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_holepunch_session_create(Session* session)
             if (!online_id_json || !json_object_is_type(online_id_json, json_type_string))
             {
                 CHIAKI_LOGE(session->log, "chiaki_holepunch_session_create: JSON does not contain member with online Id of user");
-                const char *json_str = json_object_to_json_string_ext(notif->json, JSON_C_TO_STRING_PRETTY);
-                CHIAKI_LOGV(session->log, "chiaki_holepunch_session_create: JSON was:\n%s", json_str);
+                CHIAKI_LOGV(session->log, "PSN payload omitted for privacy");
                 err = CHIAKI_ERR_UNKNOWN;
                 break;
             }
@@ -1188,8 +1228,7 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_holepunch_session_start(
             if (!member_duid_json || !json_object_is_type(member_duid_json, json_type_string))
             {
                 CHIAKI_LOGE(session->log, "chiaki_holepunch_session_start: JSON does not contain member with a deviceUniqueId string field!");
-                const char *json_str = json_object_to_json_string_ext(notif->json, JSON_C_TO_STRING_PRETTY);
-                CHIAKI_LOGV(session->log, "chiaki_holepunch_session_start: JSON was:\n%s", json_str);
+                CHIAKI_LOGV(session->log, "PSN payload omitted for privacy");
                 err = CHIAKI_ERR_UNKNOWN;
                 break;
             }
@@ -1227,8 +1266,7 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_holepunch_session_start(
             if (!custom_data1_json || !json_object_is_type(custom_data1_json, json_type_string))
             {
                 CHIAKI_LOGE(session->log, "chiaki_holepunch_session_start: JSON does not contain \"customData1\" string field");
-                const char *json_str = json_object_to_json_string_ext(notif->json, JSON_C_TO_STRING_PRETTY);
-                CHIAKI_LOGV(session->log, "chiaki_holepunch_session_start: JSON was:\n%s", json_str);
+                CHIAKI_LOGV(session->log, "PSN payload omitted for privacy");
                 err = CHIAKI_ERR_UNKNOWN;
                 break;
             }
@@ -1330,7 +1368,7 @@ static ChiakiErrorCode http_ps4_session_wakeup(Session *session)
     ChiakiErrorCode err = CHIAKI_ERR_SUCCESS;
     res = curl_easy_perform(curl);
     curl_slist_free_all(headers);
-    CHIAKI_LOGV(session->log, "http_ps4_session_wakeup: Received JSON:\n%.*s", (int)response_data.size, response_data.data);
+    CHIAKI_LOGV(session->log, "PSN payload omitted for privacy");
     if (res != CURLE_OK)
     {
         if (res == CURLE_HTTP_RETURNED_ERROR)
@@ -1338,7 +1376,7 @@ static ChiakiErrorCode http_ps4_session_wakeup(Session *session)
             long http_code = 0;
             curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
             CHIAKI_LOGE(session->log, "http_ps4_session_wakeup: Retrieving profile information for PS4 wakeup command failed with HTTP code %ld.", http_code);
-            CHIAKI_LOGV(session->log, "Response Body: %.*s.", (int)response_data.size, response_data.data);
+            CHIAKI_LOGV(session->log, "PSN payload omitted for privacy");
             err = CHIAKI_ERR_HTTP_NONOK;
         } else {
             CHIAKI_LOGE(session->log, "http_ps4_session_wakeup: Retrieving profile information for PS4 wakeup command failed with CURL error %s", curl_easy_strerror(res));
@@ -1370,7 +1408,7 @@ static ChiakiErrorCode http_ps4_session_wakeup(Session *session)
     if (schema_bad)
     {
         CHIAKI_LOGE(session->log, "http_ps4_session_wakeup: Unexpected JSON schema, could not parse user profile url");
-        CHIAKI_LOGV(session->log, json_object_to_json_string_ext(json, JSON_C_TO_STRING_PRETTY));
+        CHIAKI_LOGV(session->log, "PSN payload omitted for privacy");
         err = CHIAKI_ERR_UNKNOWN;
         goto cleanup_json;
     }
@@ -1476,11 +1514,11 @@ static ChiakiErrorCode http_ps4_session_wakeup(Session *session)
     if(res != CURLE_OK)
         CHIAKI_LOGW(session->log, "http_ps4_session_wakeup: CURL setopt CURLOPT_WRITEDATA failed with CURL error %s", curl_easy_strerror(res));
 
-    CHIAKI_LOGV(session->log, "http_ps4_session_wakeup: Sending JSON:\n%s", envelope_buf);
+    CHIAKI_LOGV(session->log, "PSN payload omitted for privacy");
 
     res = curl_easy_perform(curl);
     curl_slist_free_all(headers);
-    CHIAKI_LOGV(session->log, "http_ps4_session_wakeup: Received JSON:\n%.*s", (int)response_data.size, response_data.data);
+    CHIAKI_LOGV(session->log, "PSN payload omitted for privacy");
     if (res != CURLE_OK)
     {
         if (res == CURLE_HTTP_RETURNED_ERROR)
@@ -1488,8 +1526,8 @@ static ChiakiErrorCode http_ps4_session_wakeup(Session *session)
             long http_code = 0;
             curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
             CHIAKI_LOGE(session->log, "http_ps4_session_wakeup: Waking up ps4 console failed with HTTP code %ld.", http_code);
-            CHIAKI_LOGV(session->log, "Request Body: %s.", envelope_buf);
-            CHIAKI_LOGV(session->log, "Response Body: %.*s.", (int)response_data.size, response_data.data);
+            CHIAKI_LOGV(session->log, "PSN payload omitted for privacy");
+            CHIAKI_LOGV(session->log, "PSN payload omitted for privacy");
             if(http_code == 404)
                 CHIAKI_LOGE(session->log, "http_ps4_session_wakeup: Please make sure PS4 is registered to your account and on or in rest mode.");
             err = CHIAKI_ERR_HTTP_NONOK;
@@ -1849,11 +1887,17 @@ CHIAKI_EXPORT void chiaki_holepunch_session_fini(Session* session)
         }
     }
     stop_websocket_thread(session);
-    if(session->upnp_thread_running)
+    if(session->upnp_thread_created)
     {
-        CHIAKI_LOGI(session->log, "Waiting for UPnP discovery thread to finish...");
-        chiaki_thread_join(&session->upnp_thread, NULL);
-        session->upnp_thread_running = false;
+        // running diz se a descoberta terminou; created diz se ainda temos
+        // os recursos dela. Nem uma descoberta rápida pode ficar sem join.
+        ChiakiErrorCode err = chiaki_thread_join(&session->upnp_thread, NULL);
+        if(err != CHIAKI_ERR_SUCCESS)
+        {
+            CHIAKI_LOGE(session->log, "Could not join UPnP discovery thread: %s", chiaki_error_string(err));
+            return; // Não liberar memória que a thread ainda pode usar.
+        }
+        session->upnp_thread_created = false;
     }
     if(session->gw.data)
     {
@@ -2480,10 +2524,10 @@ ws_after_recovery:
             if (json == NULL)
             {
                 CHIAKI_LOGE(session->log, "websocket_thread_func: Parsing JSON from payload failed");
-                CHIAKI_LOGV(session->log, "websocket_thread_func: Payload was:\n%s", buf);
+                CHIAKI_LOGV(session->log, "PSN payload omitted for privacy");
                 continue;
             }
-            CHIAKI_LOGV(session->log, json_object_to_json_string_ext(json, JSON_C_TO_STRING_PRETTY));
+            CHIAKI_LOGV(session->log, "PSN payload omitted for privacy");
 
             NotificationType type = parse_notification_type(session->log, json);
             char *json_buf = malloc(rlen);
@@ -2621,7 +2665,7 @@ static NotificationType parse_notification_type(
     }else
     {
         CHIAKI_LOGW(log, "parse_notification_type: Unknown notification type \"%s\"", datatype_str);
-        CHIAKI_LOGV(log, "parse_notification_type: JSON was:\n%s", json_object_to_json_string_ext(json, JSON_C_TO_STRING_PRETTY));
+        CHIAKI_LOGV(log, "PSN payload omitted for privacy");
         return NOTIFICATION_TYPE_UNKNOWN;
     }
 }
@@ -2790,7 +2834,7 @@ CHIAKI_EXPORT ChiakiErrorCode holepunch_session_create_offer(Session *session)
     bool have_addr = false;
     Candidate *candidate_remote = &msg.conn_request->candidates[1];
     candidate_remote->type = CANDIDATE_TYPE_STATIC;
-    switch(session->gw_status)
+    switch(upnp_wait_result(session))
     {
         case GATEWAY_STATUS_UNKNOWN:
         case GATEWAY_STATUS_NOT_FOUND: {
@@ -3172,7 +3216,7 @@ static ChiakiErrorCode http_create_session(Session *session)
     if(!session_create_json)
         return CHIAKI_ERR_MEMORY;
     snprintf(session_create_json, session_create_json_len, session_create_json_fmt, session->pushctx_id);
-    CHIAKI_LOGV(session->log, "http_create_session: Sending JSON:\n%s", session_create_json);
+    CHIAKI_LOGV(session->log, "PSN payload omitted for privacy");
 
     HttpResponseData response_data = {
         .data = malloc(0),
@@ -3240,7 +3284,7 @@ static ChiakiErrorCode http_create_session(Session *session)
         CHIAKI_LOGE(session->log, "Couldn't create new json tokener");
         goto cleanup;
     }
-    CHIAKI_LOGV(session->log, "http_create_session: Received JSON:\n%s", response_data.data);
+    CHIAKI_LOGV(session->log, "PSN payload omitted for privacy");
     json_object *json = json_tokener_parse_ex(tok, response_data.data, response_data.size);
     if (json == NULL)
     {
@@ -3263,7 +3307,7 @@ static ChiakiErrorCode http_create_session(Session *session)
     if (schema_bad)
     {
         CHIAKI_LOGE(session->log, "http_create_session: Unexpected JSON schema, could not parse sessionId and accountId.");
-        CHIAKI_LOGV(session->log, json_object_to_json_string_ext(json, JSON_C_TO_STRING_PRETTY));
+        CHIAKI_LOGV(session->log, "PSN payload omitted for privacy");
         err = CHIAKI_ERR_UNKNOWN;
         goto cleanup_json;
     }
@@ -3271,7 +3315,7 @@ static ChiakiErrorCode http_create_session(Session *session)
     if (strlen(session_id) != 36)
     {
         CHIAKI_LOGE(session->log, "http_create_session: Unexpected JSON schema, sessionId is not a UUIDv4, was '%s'.", session_id);
-        CHIAKI_LOGV(session->log, json_object_to_json_string_ext(json, JSON_C_TO_STRING_PRETTY));
+        CHIAKI_LOGV(session->log, "PSN payload omitted for privacy");
         err = CHIAKI_ERR_UNKNOWN;
         goto cleanup_json;
     }
@@ -3368,8 +3412,7 @@ static ChiakiErrorCode http_check_session(Session *session, bool viewurl)
         err = CHIAKI_ERR_UNKNOWN;
         goto cleanup_json_tokener;
     }
-    const char *json_str = json_object_to_json_string_ext(json, JSON_C_TO_STRING_PRETTY);
-    CHIAKI_LOGV(session->log, "http_check_session: retrieved session data \n%s", json_str);
+    CHIAKI_LOGV(session->log, "PSN payload omitted for privacy");
 
     json_object_put(json);
     cleanup_json_tokener:
@@ -3463,11 +3506,11 @@ static ChiakiErrorCode http_start_session(Session *session)
     if(res != CURLE_OK)
         CHIAKI_LOGW(session->log, "http_start_session: CURL setopt CURLOPT_WRITEDATA failed with CURL error %s", curl_easy_strerror(res));
 
-    CHIAKI_LOGV(session->log, "http_start_session: Sending JSON:\n%s", envelope_buf);
+    CHIAKI_LOGV(session->log, "PSN payload omitted for privacy");
 
     res = curl_easy_perform(curl);
     curl_slist_free_all(headers);
-    CHIAKI_LOGV(session->log, "http_start_session: Received JSON:\n%.*s", (int)response_data.size, response_data.data);
+    CHIAKI_LOGV(session->log, "PSN payload omitted for privacy");
     if (res != CURLE_OK)
     {
         if (res == CURLE_HTTP_RETURNED_ERROR)
@@ -3475,8 +3518,8 @@ static ChiakiErrorCode http_start_session(Session *session)
             long http_code = 0;
             curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
             CHIAKI_LOGE(session->log, "http_start_session: Starting holepunch session failed with HTTP code %ld.", http_code);
-            CHIAKI_LOGV(session->log, "Request Body: %s.", envelope_buf);
-            CHIAKI_LOGV(session->log, "Response Body: %.*s.", (int)response_data.size, response_data.data);
+            CHIAKI_LOGV(session->log, "PSN payload omitted for privacy");
+            CHIAKI_LOGV(session->log, "PSN payload omitted for privacy");
             err = CHIAKI_ERR_HTTP_NONOK;
         } else {
             CHIAKI_LOGE(session->log, "http_start_session: Starting holepunch session failed with CURL error %s.", curl_easy_strerror(res));
@@ -3544,7 +3587,7 @@ static ChiakiErrorCode http_send_session_message(Session *session, SessionMessag
         payload_str, session->account_id, console_uid_str,
         session->console_type == CHIAKI_HOLEPUNCH_CONSOLE_TYPE_PS4 ? "PS4" : "PS5"
     );
-    CHIAKI_LOGV(session->log, "Message to send: %s", msg_buf);
+    CHIAKI_LOGV(session->log, "PSN payload omitted for privacy");
     CURL *curl = curl_easy_init();
     if(!curl)
     {
@@ -3592,7 +3635,7 @@ static ChiakiErrorCode http_send_session_message(Session *session, SessionMessag
             long http_code = 0;
             curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
             CHIAKI_LOGE(session->log, "http_send_session_message: Sending holepunch session message failed with HTTP code %ld.", http_code);
-            CHIAKI_LOGV(session->log, "Request Body: %s.", msg_buf);
+            CHIAKI_LOGV(session->log, "PSN payload omitted for privacy");
             err = CHIAKI_ERR_HTTP_NONOK;
         } else {
             CHIAKI_LOGE(session->log, "http_send_session_message: Sending holepunch session message failed with CURL error %s.", curl_easy_strerror(res));
@@ -3935,6 +3978,7 @@ static bool get_client_addr_remote_stun(Session *session, char *address, uint16_
         {
             CHIAKI_LOGW(session->log, "Getting stun servers returned error %s", chiaki_error_string(err));
         }
+        prefer_reliable_stun_servers(session);
         if (!stun_port_allocation_test(session->log, address, port, &session->stun_allocation_increment, &session->stun_random_allocation, session->stun_server_list, session->num_stun_servers, sock))
         {
             CHIAKI_LOGE(session->log, "get_client_addr_remote_stun: Failed to get external address");
@@ -5184,14 +5228,14 @@ static json_object* session_message_get_payload(ChiakiLog *log, json_object *ses
     if (json_pointer_get(session_message, "/body/data/sessionMessage/payload", &payload_json) < 0)
     {
         CHIAKI_LOGE(log, "session_message_get_payload: Failed to get payload");
-        CHIAKI_LOGV(log, json_object_to_json_string_ext(session_message, JSON_C_TO_STRING_PRETTY));
+        CHIAKI_LOGV(log, "PSN payload omitted for privacy");
         return NULL;
     }
 
     if (!json_object_is_type(payload_json, json_type_string))
     {
         CHIAKI_LOGE(log, "session_message_get_payload: Payload is not a string");
-        CHIAKI_LOGV(log, json_object_to_json_string_ext(session_message, JSON_C_TO_STRING_PRETTY));
+        CHIAKI_LOGV(log, "PSN payload omitted for privacy");
         return NULL;
     }
 
@@ -5240,15 +5284,15 @@ static json_object* session_message_get_payload(ChiakiLog *log, json_object *ses
         message_json = json_tokener_parse(fixed_json);
         if(message_json == NULL)
         {
-            CHIAKI_LOGE(log, "Couldn't parse the following fixed json: %s", fixed_json);
-            CHIAKI_LOGE(log, json_object_to_json_string_ext(payload_json, JSON_C_TO_STRING_PRETTY));
+            CHIAKI_LOGE(log, "Could not parse PSN session payload (body omitted for privacy)");
+            CHIAKI_LOGE(log, "PSN payload omitted for privacy");
         }
     }
         // check if parse fails
         if(message_json == NULL)
         {
-            CHIAKI_LOGE(log, "Couldn't parse the following json: %s", json);
-            CHIAKI_LOGE(log, json_object_to_json_string_ext(payload_json, JSON_C_TO_STRING_PRETTY));
+            CHIAKI_LOGE(log, "Could not parse PSN session payload (body omitted for privacy)");
+            CHIAKI_LOGE(log, "PSN payload omitted for privacy");
         }
 
     return message_json;
@@ -5595,7 +5639,7 @@ static ChiakiErrorCode session_message_parse(
         err = chiaki_base64_decode(skey_str, strlen(skey_str), msg->conn_request->skey, &skey_len);
         if (err != CHIAKI_ERR_SUCCESS)
         {
-            CHIAKI_LOGE(log, "session_message_parse: Failed to decode skey: '%s'", skey_str);
+            CHIAKI_LOGE(log, "session_message_parse: Failed to decode session key");
             goto cleanup;
         }
 
@@ -5640,7 +5684,7 @@ static ChiakiErrorCode session_message_parse(
             msg->conn_request->local_hashed_id, &local_hashed_id_len);
         if (err != CHIAKI_ERR_SUCCESS)
         {
-            CHIAKI_LOGE(log, "session_message_parse: Failed to decode localHashedId: '%s'", local_hashed_id_str);
+            CHIAKI_LOGE(log, "session_message_parse: Failed to decode local hashed identifier");
             goto cleanup;
         }
 
@@ -5723,7 +5767,7 @@ static ChiakiErrorCode session_message_parse(
 
 invalid_schema:
     CHIAKI_LOGE(log, "session_message_parse: Unexpected JSON schema for holepunch session message.");
-    CHIAKI_LOGV(log, json_object_to_json_string_ext(message_json, JSON_C_TO_STRING_PRETTY));
+    CHIAKI_LOGV(log, "PSN payload omitted for privacy");
     err = CHIAKI_ERR_UNKNOWN;
 
 cleanup:
@@ -6016,7 +6060,7 @@ static ChiakiErrorCode get_stun_servers(Session *session)
             long http_code = 0;
             curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
             CHIAKI_LOGE(session->log, "Getting stun servers from %s failed with HTTP code %ld", STUN_HOSTS_URL, http_code);
-            CHIAKI_LOGV(session->log, "Response Body: %.*s.", (int)response_data.size, response_data.data);
+            CHIAKI_LOGV(session->log, "PSN payload omitted for privacy");
             err = CHIAKI_ERR_HTTP_NONOK;
         } else {
             CHIAKI_LOGE(session->log, "Getting stun servers from %s failed with CURL error %s", STUN_HOSTS_URL, curl_easy_strerror(res));
@@ -6099,7 +6143,7 @@ static ChiakiErrorCode get_stun_servers(Session *session)
             long http_code = 0;
             curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
             CHIAKI_LOGE(session->log, "Getting IPV6 stun servers from %s failed with HTTP code %ld", STUN_HOSTS_URL, http_code);
-            CHIAKI_LOGV(session->log, "Response Body: %.*s.", (int)response_data.size, response_data.data);
+            CHIAKI_LOGV(session->log, "PSN payload omitted for privacy");
             err = CHIAKI_ERR_HTTP_NONOK;
         } else {
             CHIAKI_LOGE(session->log, "Getting IPV6 stun servers from %s failed with CURL error %s", STUN_HOSTS_URL, curl_easy_strerror(res));
@@ -6326,4 +6370,40 @@ static void remove_substring(char *str, char *substring)
         return;
     char *end = start + strlen(substring);
     memmove(start, start + strlen(substring), strlen(end) + 1);
+}
+
+// P5M: the downloaded list ("always online" servers) often starts with hosts
+// that no longer resolve, and each one cost a lookup before the connection
+// could go on. Google's servers go first; the downloaded ones fill the rest.
+static void prefer_reliable_stun_servers(Session *session)
+{
+    static const char *const reliable[] = {
+        "stun.l.google.com", "stun1.l.google.com", "stun2.l.google.com", "stun3.l.google.com",
+    };
+    const size_t n_reliable = sizeof(reliable) / sizeof(reliable[0]);
+    const size_t cap = sizeof(session->stun_server_list) / sizeof(session->stun_server_list[0]);
+    StunServer merged[sizeof(session->stun_server_list) / sizeof(session->stun_server_list[0])];
+    size_t n = 0;
+    for(size_t i = 0; i < n_reliable && n < cap; i++)
+    {
+        char *host = strdup(reliable[i]);
+        if(!host)
+            break;
+        merged[n].host = host;
+        merged[n].port = 19302;
+        n++;
+    }
+    for(size_t i = 0; i < session->num_stun_servers; i++)
+    {
+        bool dup = false;
+        for(size_t k = 0; k < n_reliable; k++)
+            if(strcmp(session->stun_server_list[i].host, reliable[k]) == 0)
+                dup = true;
+        if(dup || n >= cap)
+            free(session->stun_server_list[i].host);
+        else
+            merged[n++] = session->stun_server_list[i];
+    }
+    memcpy(session->stun_server_list, merged, n * sizeof(StunServer));
+    session->num_stun_servers = n;
 }

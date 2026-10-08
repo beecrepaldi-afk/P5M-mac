@@ -479,6 +479,28 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_rudp_send_recv(RudpInstance *rudp, RudpMess
         ChiakiErrorCode err = chiaki_rudp_select_recv(rudp, 1500, message);
         if(err == CHIAKI_ERR_TIMEOUT)
             continue;
+        // P5M: erro de rede aqui nao e motivo para desistir, e o laco ja
+        // tem orcamento de tentativas que nao estava sendo usado.
+        //
+        // O caso concreto: num socket UDP *conectado*, o Linux entrega um
+        // ICMP port-unreachable de um envio anterior como ECONNREFUSED na
+        // proxima leitura. A furacao de NAT manda sondas para varios
+        // candidatos antes de escolher um, entao e normal sobrar um desses
+        // erros na fila -- e ele aparecia na primeira leitura da sessao,
+        // *depois* de o registro pelo tunel ja ter dado certo no mesmo
+        // socket. Um erro assincrono de um pacote antigo derrubava uma
+        // conexao que estava viva.
+        //
+        // O erro e consumido pela leitura que falhou, entao a tentativa
+        // seguinte encontra o caminho limpo. Se o console tiver mesmo sumido,
+        // as tentativas se esgotam e a falha aparece igual, so que depois de
+        // ter tentado.
+        if(err == CHIAKI_ERR_NETWORK)
+        {
+            CHIAKI_LOGW(rudp->log, "P5M: rudp read failed; attempt %d of %d",
+                    i + 1, (int)tries);
+            continue;
+        }
         if(err != CHIAKI_ERR_SUCCESS)
             return err;
         bool found = true;
