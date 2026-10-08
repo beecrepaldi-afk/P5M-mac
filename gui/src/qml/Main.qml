@@ -165,6 +165,11 @@ Item {
         confirmDialog.open();
     }
 
+    // Report a problem: ZIP of the sanitized diary on the Desktop + a new GitHub issue.
+    function reportProblem() {
+        showInfoDialog(qsTr("Report a problem"), Chiaki.reportProblem());
+    }
+
     function showInfoDialog(title, text) {
         infoDialog.title = title;
         infoDialog.text = text;

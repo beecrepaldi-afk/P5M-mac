@@ -145,17 +145,26 @@ Pane {
                     glyph: "OPTIONS"
                     onClicked: root.showSettingsDialog("general")
                     KeyNavigation.up: navController
-                    KeyNavigation.down: navQuit
+                    KeyNavigation.down: navReport
                     KeyNavigation.right: hostsView
                 }
                 Item { Layout.fillHeight: true }
+                GlassButton {
+                    id: navReport
+                    Layout.fillWidth: true
+                    text: qsTr("Report a problem")
+                    onClicked: root.reportProblem()
+                    KeyNavigation.up: navGeneral
+                    KeyNavigation.down: navQuit
+                    KeyNavigation.right: hostsView
+                }
                 GlassButton {
                     id: navQuit
                     Layout.fillWidth: true
                     text: qsTr("Quit")
                     glyph: "circle"
                     onClicked: consolePane.confirmQuit()
-                    KeyNavigation.up: navGeneral
+                    KeyNavigation.up: navReport
                     KeyNavigation.right: hostsView
                 }
             }

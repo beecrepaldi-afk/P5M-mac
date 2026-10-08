@@ -1,0 +1,37 @@
+name: Report a problem
+description: Something went wrong in P5M. The "Report a problem" button in the app fills in most of this.
+labels: [problem]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting! Drag the `P5M-report-….zip` file the app saved on your Desktop into the box below.
+        It has the diary of your last session with addresses, accounts and keys removed.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      placeholder: "Example: the picture froze for a few seconds in the middle of a race."
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect?
+  - type: textarea
+    id: steps
+    attributes:
+      label: How to make it happen again (if you know)
+  - type: input
+    id: version
+    attributes:
+      label: P5M version
+  - type: input
+    id: system
+    attributes:
+      label: macOS and Mac
+  - type: textarea
+    id: report
+    attributes:
+      label: Report file
+      description: Drag the ZIP here.

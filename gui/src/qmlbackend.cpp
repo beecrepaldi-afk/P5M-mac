@@ -1,4 +1,6 @@
 #include "qmlbackend.h"
+#include "sessionlog.h"
+#include "logsanitizer.h"
 #include "macSystemConsoleIdentity.h"
 #include <QJsonArray>
 #include <QJsonDocument>
@@ -39,6 +41,15 @@
 #include <QImageReader>
 #include <QProcessEnvironment>
 #include <QDesktopServices>
+#include <QDir>
+#include <QFile>
+#include <QProcess>
+#include <QStandardPaths>
+#include <QSysInfo>
+#include <QTemporaryDir>
+#ifdef Q_OS_MACOS
+#include <sys/sysctl.h>
+#endif
 #include <QtConcurrent>
 #include <QTimer>
 
@@ -2915,6 +2926,104 @@ void QmlBackend::setSystemDiagnosticContext(bool visible)
         p5m_mac_system_clear_context();
     }
 #endif
+}
+
+#ifndef P5M_ISSUES_URL
+#define P5M_ISSUES_URL "https://github.com/beecrepaldi-afk/P5M-mac/issues/new"
+#endif
+
+#ifdef Q_OS_MACOS
+static QString P5MSysctlString(const char *name)
+{
+    size_t size = 0;
+    if (sysctlbyname(name, nullptr, &size, nullptr, 0) != 0 || size == 0)
+        return QString();
+    QByteArray buf(static_cast<int>(size), '\0');
+    if (sysctlbyname(name, buf.data(), &size, nullptr, 0) != 0)
+        return QString();
+    return QString::fromUtf8(buf.constData());
+}
+#endif
+
+// The diary is already sanitized when written (the default); this runs again
+// in case it was not, and also hides console IDs and the session ID.
+static QString P5MReportSanitize(const QString &text)
+{
+    static const QRegularExpression console_id(R"(\b[0-9A-Fa-f]{12}\b)");
+    static const QRegularExpression session_id(R"((session id\s+)\S+)", QRegularExpression::CaseInsensitiveOption);
+    QStringList lines = text.split(QLatin1Char('\n'));
+    for (QString &line : lines) {
+        line = SanitizeLogMessage(line);
+        line.replace(console_id, QStringLiteral("<console-id>"));
+        line.replace(session_id, QStringLiteral("\\1<redacted>"));
+    }
+    return lines.join(QLatin1Char('\n'));
+}
+
+QString QmlBackend::reportProblem()
+{
+    const QString version = QCoreApplication::applicationVersion();
+    QString model, chip;
+#ifdef Q_OS_MACOS
+    model = P5MSysctlString("hw.model");
+    chip = P5MSysctlString("machdep.cpu.brand_string");
+#endif
+    const QString system = QSysInfo::prettyProductName();
+
+    // Newest diary: names carry the date, so the last one sorted is the newest.
+    QString diary_text;
+    const QString log_dir = GetLogBaseDir();
+    if (!log_dir.isEmpty()) {
+        const QStringList logs = QDir(log_dir).entryList({ QStringLiteral("chiaki_session_*.log") }, QDir::Files, QDir::Name);
+        if (!logs.isEmpty()) {
+            QFile f(QDir(log_dir).filePath(logs.last()));
+            if (f.open(QIODevice::ReadOnly))
+                diary_text = P5MReportSanitize(QString::fromUtf8(f.readAll()));
+        }
+    }
+
+    const QString stamp = QDateTime::currentDateTime().toString(QStringLiteral("yyyy-MM-dd_HH-mm"));
+    const QString name = QStringLiteral("P5M-report-%1").arg(stamp);
+    QTemporaryDir tmp;
+    if (!tmp.isValid())
+        return tr("Could not create the report.");
+    QDir folder(tmp.path());
+    folder.mkdir(name);
+    folder.cd(name);
+
+    QFile info(folder.filePath(QStringLiteral("info.txt")));
+    if (info.open(QIODevice::WriteOnly | QIODevice::Text)) {
+        info.write(QStringLiteral("P5M %1\n%2\nMac %3\n%4\n").arg(version, system, model, chip).toUtf8());
+        info.close();
+    }
+    QFile diary(folder.filePath(QStringLiteral("session.log")));
+    if (diary.open(QIODevice::WriteOnly | QIODevice::Text)) {
+        diary.write(diary_text.isEmpty() ? QByteArray("No session diary yet.\n") : diary_text.toUtf8());
+        diary.close();
+    }
+
+    QString desktop = QStandardPaths::writableLocation(QStandardPaths::DesktopLocation);
+    if (desktop.isEmpty())
+        desktop = QDir::homePath();
+    const QString zip = QDir(desktop).filePath(name + QStringLiteral(".zip"));
+    QFile::remove(zip);
+    const int rc = QProcess::execute(QStringLiteral("/usr/bin/ditto"),
+        { QStringLiteral("-c"), QStringLiteral("-k"), QStringLiteral("--keepParent"), folder.absolutePath(), zip });
+    if (rc != 0 || !QFile::exists(zip))
+        return tr("Could not create the report.");
+
+    QProcess::startDetached(QStringLiteral("/usr/bin/open"), { QStringLiteral("-R"), zip });
+
+    // Issue form fields are prefilled through the query (ids from .github/ISSUE_TEMPLATE/problem.yml).
+    QUrl url(QStringLiteral(P5M_ISSUES_URL));
+    QUrlQuery query;
+    query.addQueryItem(QStringLiteral("template"), QStringLiteral("problem.yml"));
+    query.addQueryItem(QStringLiteral("version"), version);
+    query.addQueryItem(QStringLiteral("system"), QStringLiteral("%1, %2, %3").arg(system, model, chip));
+    url.setQuery(query);
+    QDesktopServices::openUrl(url);
+
+    return tr("The report %1 is on your Desktop. Your browser opened a new issue: describe what happened and drag the file onto it.\n\nThe diary inside has addresses, accounts and keys removed. You need a free GitHub account to send it.").arg(name + QStringLiteral(".zip"));
 }
 
 void QmlBackend::showSystemDiagnostics()
